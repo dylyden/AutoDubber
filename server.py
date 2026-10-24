@@ -32,11 +32,23 @@ def get_base_path():
     return os.path.dirname(os.path.abspath(__file__))
 
 def get_subtitles_dir():
-    candidates = []
     if getattr(sys, 'frozen', False):
-        candidates.append(os.path.join(os.path.dirname(sys.executable), "subtitles"))
-    candidates.append(os.path.join(os.getcwd(), "subtitles"))
-    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles"))
+        exe_dir = os.path.dirname(sys.executable)
+        target = os.path.join(exe_dir, "subtitles")
+        internal_target = os.path.join(exe_dir, "_internal", "subtitles")
+        os.makedirs(target, exist_ok=True)
+        if not os.path.exists(internal_target):
+            try:
+                import subprocess
+                subprocess.run(["cmd", "/c", "mklink", "/J", internal_target, target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+        return target
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist", "AutoDubber", "subtitles"),
+        os.path.join(os.getcwd(), "subtitles")
+    ]
     for c in candidates:
         if os.path.exists(c):
             return c
