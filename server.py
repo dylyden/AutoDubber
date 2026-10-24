@@ -31,6 +31,19 @@ def get_base_path():
         return sys._MEIPASS
     return os.path.dirname(os.path.abspath(__file__))
 
+def get_subtitles_dir():
+    candidates = []
+    if getattr(sys, 'frozen', False):
+        candidates.append(os.path.join(os.path.dirname(sys.executable), "subtitles"))
+    candidates.append(os.path.join(os.getcwd(), "subtitles"))
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles"))
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    target = candidates[0]
+    os.makedirs(target, exist_ok=True)
+    return target
+
 import json
 import uuid
 import asyncio
@@ -72,28 +85,12 @@ async def lifespan(app: FastAPI):
     main_loop = asyncio.get_running_loop()
 
 
-    # Bulletproof cleanup on application startup/restart (fresh start each session)
+    # Ensure subtitles directory exists
     try:
-        import shutil
-        subtitles_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles")
-        if os.path.exists(subtitles_dir):
-            logger.info("Cleaning subtitles cache on startup...")
-            for filename in os.listdir(subtitles_dir):
-                file_path = os.path.join(subtitles_dir, filename)
-                try:
-                    if os.path.isfile(file_path) or os.path.islink(file_path):
-                        os.unlink(file_path)
-                    elif os.path.isdir(file_path):
-                        shutil.rmtree(file_path)
-                except Exception as e:
-                    logger.error(f"Startup clean failed for {file_path}: {e}")
-
-        # Reset queue file to empty list
-        queue_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queue.json")
-        with open(queue_file, "w") as f:
-            json.dump([], f)
-    except Exception as startup_clean_err:
-        logger.error(f"Startup cleanup error: {startup_clean_err}")
+        subtitles_dir = get_subtitles_dir()
+        os.makedirs(subtitles_dir, exist_ok=True)
+    except Exception as init_err:
+        logger.error(f"Failed to initialize subtitles dir: {init_err}")
 
     send_log("DenZin Auto-Dubber Engine Initialized. Ready for actions.", "success")
     yield
@@ -364,7 +361,7 @@ async def delete_queue_item(video_id: str):
     global queue
     try:
         import shutil
-        subtitles_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles")
+        subtitles_dir = get_subtitles_dir()
         subtitles_json_path = os.path.join(subtitles_dir, f"{video_id}.json")
         seg_preview_dir = os.path.join(subtitles_dir, str(video_id))
         if os.path.exists(subtitles_json_path):
@@ -406,7 +403,7 @@ async def remove_completed():
     completed_items = [item for item in queue if item["status"] == "Completed"]
     try:
         import shutil
-        subtitles_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles")
+        subtitles_dir = get_subtitles_dir()
         for item in completed_items:
             video_id = item["id"]
             subtitles_json_path = os.path.join(subtitles_dir, f"{video_id}.json")
@@ -430,7 +427,7 @@ async def clear_all():
         from dubber import clear_locked_speaker_roles
         clear_locked_speaker_roles()
         import shutil
-        subtitles_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles")
+        subtitles_dir = get_subtitles_dir()
         for item in queue:
             video_id = item["id"]
             subtitles_json_path = os.path.join(subtitles_dir, f"{video_id}.json")
@@ -806,7 +803,7 @@ async def run_pipeline_for_video(video):
     try:
         video["status"] = "Processing"
         if video.get("is_redub"):
-            subtitles_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles")
+            subtitles_dir = get_subtitles_dir()
             subtitles_json_path = os.path.join(subtitles_dir, f"{video['id']}.json")
             if os.path.exists(subtitles_json_path):
                 with open(subtitles_json_path, "r", encoding="utf-8") as sf:
@@ -1048,29 +1045,97 @@ def sanitize_segment_timestamps(segments):
                     
     return segments
 
+def get_all_subtitles_dirs():
+    dirs = [get_subtitles_dir()]
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(sys.executable)
+        dirs.extend([
+            os.path.join(exe_dir, "subtitles"),
+            os.path.join(exe_dir, "_internal", "subtitles"),
+        ])
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    dirs.extend([
+        os.path.join(app_dir, "subtitles"),
+        os.path.join(app_dir, "dist", "AutoDubber", "subtitles"),
+        os.path.join(os.getcwd(), "subtitles")
+    ])
+    seen = set()
+    res = []
+    for d in dirs:
+        norm = os.path.normpath(d)
+        if norm not in seen:
+            seen.add(norm)
+            res.append(norm)
+    return res
+
+def find_subtitles_json(video_id: str):
+    dirs = get_all_subtitles_dirs()
+    # 1. Exact video_id match
+    for d in dirs:
+        cand = os.path.join(d, f"{video_id}.json")
+        if os.path.exists(cand):
+            return cand, d
+
+    # 2. Check if video matches any queue item
+    v_item = next((item for item in queue if item.get("id") == video_id), None)
+    if v_item:
+        v_path = v_item.get("path", "")
+        if v_path:
+            v_dir = os.path.dirname(v_path)
+            for out_cand in [os.path.join(v_dir, "Dubbed_Output"), os.path.join(v_dir, "YouTube_Subtitles")]:
+                if os.path.isdir(out_cand):
+                    for f in os.listdir(out_cand):
+                        if f.endswith(".json"):
+                            return os.path.join(out_cand, f), out_cand
+
+    # 3. Fallback: If only 1 json file in any search dir, return it
+    for d in dirs:
+        if os.path.isdir(d):
+            jsons = [f for f in os.listdir(d) if f.endswith(".json")]
+            if len(jsons) == 1:
+                return os.path.join(d, jsons[0]), d
+
+    return None, dirs[0]
+
+def find_segment_audio_file(video_id: str, seg_id: str):
+    dirs = get_all_subtitles_dirs()
+    # Direct video_id subfolder
+    for d in dirs:
+        cand = os.path.join(d, video_id, f"seg_{seg_id}.wav")
+        if os.path.exists(cand):
+            return cand
+
+    # Any subfolder containing seg_{seg_id}.wav
+    for d in dirs:
+        if os.path.isdir(d):
+            for sub in os.listdir(d):
+                sub_dir = os.path.join(d, sub)
+                if os.path.isdir(sub_dir):
+                    cand = os.path.join(sub_dir, f"seg_{seg_id}.wav")
+                    if os.path.exists(cand):
+                        return cand
+    return None
+
 @app.get("/api/subtitles/{video_id}")
 async def get_subtitles(video_id: str):
-    subtitles_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles")
-    subtitles_json_path = os.path.join(subtitles_dir, f"{video_id}.json")
-    if not os.path.exists(subtitles_json_path):
+    subtitles_json_path, found_dir = find_subtitles_json(video_id)
+    if not subtitles_json_path or not os.path.exists(subtitles_json_path):
         return {"subtitles": []}
     try:
         with open(subtitles_json_path, "r", encoding="utf-8") as f:
             segments = json.load(f)
-        
-        # Sanitize segment timestamps to prevent UI table and timeline overlap
+
         segments = sanitize_segment_timestamps(segments)
 
-        # Attach actual voice duration if cached WAV exists
         for idx, seg in enumerate(segments):
             seg_id = seg.get("id") or (idx + 1)
             seg["id"] = seg_id
-            wav_path = os.path.join(subtitles_dir, video_id, f"seg_{seg_id}.wav")
-            if os.path.exists(wav_path):
+            wav_path = find_segment_audio_file(video_id, str(seg_id))
+            if wav_path and os.path.exists(wav_path):
                 dur = get_wav_duration(wav_path)
                 if dur:
                     seg["audio_duration"] = dur
-                    
+
         return {"subtitles": segments}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read subtitles: {str(e)}")
@@ -1080,52 +1145,32 @@ class SubtitlesPayload(BaseModel):
 
 @app.post("/api/subtitles/{video_id}")
 async def save_subtitles(video_id: str, req: SubtitlesPayload):
-    subtitles_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles")
+    subtitles_dir = get_subtitles_dir()
     os.makedirs(subtitles_dir, exist_ok=True)
-    subtitles_json_path = os.path.join(subtitles_dir, f"{video_id}.json")
+    subtitles_json_path, _ = find_subtitles_json(video_id)
+    if not subtitles_json_path:
+        subtitles_json_path = os.path.join(subtitles_dir, f"{video_id}.json")
     try:
-        # Load existing subtitles to compare and identify changes
-        old_segments = []
-        if os.path.exists(subtitles_json_path):
-            try:
-                with open(subtitles_json_path, "r", encoding="utf-8") as old_f:
-                    old_segments = json.load(old_f)
-            except Exception:
-                pass
-        
-        # Build dictionary of old segments for quick comparison
-        old_by_id = {}
-        for seg in old_segments:
-            s_id = str(seg.get("id"))
-            if s_id:
-                old_by_id[s_id] = seg
-        
-        # Note: We intentionally DO NOT delete the cached WAV files here anymore.
-        # Previously, this code tried to detect if the text/timing changed and auto-deleted the WAVs.
-        # However, due to frontend parsing differences, it often falsely detected changes and wiped the files
-        # causing 404 Not Found when clicking the Play button.
-        # The user must click the "Re-Dub" (Refresh) button to explicitly overwrite audio.
-
-        # Sanitize segment timestamps before saving to disk
         sanitized_subtitles = sanitize_segment_timestamps(req.subtitles)
-
-        # Save the new JSON to disk
         with open(subtitles_json_path, "w", encoding="utf-8") as f:
             json.dump(sanitized_subtitles, f, ensure_ascii=False, indent=4)
+        primary_path = os.path.join(subtitles_dir, f"{video_id}.json")
+        if os.path.normpath(subtitles_json_path) != os.path.normpath(primary_path):
+            with open(primary_path, "w", encoding="utf-8") as f:
+                json.dump(sanitized_subtitles, f, ensure_ascii=False, indent=4)
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save subtitles: {str(e)}")
 
 @app.get("/api/subtitles/{video_id}/audio/{seg_id}")
 async def get_segment_audio(video_id: str, seg_id: str, request: Request = None):
-    subtitles_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles")
-    seg_audio_path = os.path.join(subtitles_dir, video_id, f"seg_{seg_id}.wav")
-    if not os.path.exists(seg_audio_path):
+    seg_audio_path = find_segment_audio_file(video_id, str(seg_id))
+    if not seg_audio_path or not os.path.exists(seg_audio_path):
         raise HTTPException(status_code=404, detail="Segment audio preview not found. Please dub/re-dub this segment first.")
-    
+
     file_size = os.path.getsize(seg_audio_path)
     range_header = request.headers.get("Range") if request else None
-    
+
     if range_header:
         try:
             range_val = range_header.strip().replace("bytes=", "")
@@ -1147,7 +1192,7 @@ async def get_segment_audio(video_id: str, seg_id: str, request: Request = None)
                 "Content-Length": str(content_length),
             }
         )
-    
+
     return StreamingResponse(
         range_stream(seg_audio_path, 0, file_size - 1),
         status_code=200,
@@ -1173,7 +1218,7 @@ async def re_dub_single_segment_endpoint(video_id: str, seg_id: str, req: Single
         raise HTTPException(status_code=404, detail="Video item not found in queue.")
         
     try:
-        subtitles_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles")
+        subtitles_dir = get_subtitles_dir()
         subtitles_json_path = os.path.join(subtitles_dir, f"{video_id}.json")
         with open(subtitles_json_path, "w", encoding="utf-8") as f:
             json.dump(req.segments, f, ensure_ascii=False, indent=4)

@@ -27,6 +27,7 @@ __pycache__/
 *.pyo
 .vscode/
 scratch/
+subtitles/
 test_*.mp3
 dist_test.mp3
 edge_tts_fix.zip

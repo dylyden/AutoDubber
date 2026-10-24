@@ -18,6 +18,19 @@ def get_base_path():
         return sys._MEIPASS
     return os.path.dirname(os.path.abspath(__file__))
 
+def get_subtitles_dir():
+    candidates = []
+    if getattr(sys, 'frozen', False):
+        candidates.append(os.path.join(os.path.dirname(sys.executable), "subtitles"))
+    candidates.append(os.path.join(os.getcwd(), "subtitles"))
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles"))
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    target = candidates[0]
+    os.makedirs(target, exist_ok=True)
+    return target
+
 def get_ffmpeg_cmd():
     search_paths = [get_base_path()]
     if getattr(sys, 'frozen', False):
@@ -2080,7 +2093,7 @@ class Dubber:
                 
                 # Save a permanent copy for preview
                 try:
-                    seg_preview_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles", str(video_id))
+                    seg_preview_dir = os.path.join(get_subtitles_dir(), str(video_id))
                     os.makedirs(seg_preview_dir, exist_ok=True)
                     seg_preview_path = os.path.join(seg_preview_dir, f"seg_{seg_id}.wav")
                     final_seg.export(seg_preview_path, format="wav")
@@ -2155,7 +2168,7 @@ class Dubber:
                         dubbed_audio = dubbed_audio.overlay(placed_audio, position=pos_ms)
                         
                         try:
-                            seg_preview_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles", str(video_id))
+                            seg_preview_dir = os.path.join(get_subtitles_dir(), str(video_id))
                             seg_preview_path = os.path.join(seg_preview_dir, f"seg_{seg.get('id', item_idx+1)}.wav")
                             placed_audio.export(seg_preview_path, format="wav")
                         except Exception:
@@ -2310,7 +2323,7 @@ class Dubber:
             
             # Save a copy of the clean background audio track for future re-dubs
             try:
-                seg_preview_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles", str(video_id))
+                seg_preview_dir = os.path.join(get_subtitles_dir(), str(video_id))
                 os.makedirs(seg_preview_dir, exist_ok=True)
                 bg_cache_path = os.path.join(seg_preview_dir, "bg_mixed.wav")
                 if any_bg_enabled and vocals_path and os.path.exists(vocals_path) and stems_mixed:
@@ -2362,7 +2375,7 @@ class Dubber:
             
             # Save subtitle segments to a permanent JSON file in subtitles/ folder
             try:
-                subtitles_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles")
+                subtitles_dir = get_subtitles_dir()
                 os.makedirs(subtitles_dir, exist_ok=True)
                 subtitles_json_path = os.path.join(subtitles_dir, f"{video_id}.json")
                 with open(subtitles_json_path, "w", encoding="utf-8") as sf:
@@ -2462,7 +2475,7 @@ class Dubber:
             lang_code = self.settings.get("target_lang", "km-KH")
             male_voice, female_voice = VOICES.get(lang_code, VOICES["km-KH"])
             
-            seg_preview_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles", str(video_id))
+            seg_preview_dir = os.path.join(get_subtitles_dir(), str(video_id))
             sem = asyncio.Semaphore(2 if self.settings.get("tts_engine", "edge-tts") == "edge-tts" else 4)
             
             async def process_re_dub_segment(idx, seg):
@@ -2679,7 +2692,7 @@ class Dubber:
                         dubbed_audio = dubbed_audio.overlay(placed_audio, position=pos_ms)
                         
                         try:
-                            seg_preview_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles", str(video_id))
+                            seg_preview_dir = os.path.join(get_subtitles_dir(), str(video_id))
                             seg_preview_path = os.path.join(seg_preview_dir, f"seg_{seg.get('id', item_idx+1)}.wav")
                             placed_audio.export(seg_preview_path, format="wav")
                         except Exception:
@@ -2723,7 +2736,7 @@ class Dubber:
                 bg_mixed = AudioSegment.silent(duration=original_duration_ms)
             else:
                 # Check if we have a permanently saved clean background track
-                bg_mixed_wav_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles", str(video_id), "bg_mixed.wav")
+                bg_mixed_wav_path = os.path.join(get_subtitles_dir(), str(video_id), "bg_mixed.wav")
                 if os.path.exists(bg_mixed_wav_path):
                     self.log("Loading clean background music track from cache...", "info")
                     try:
@@ -2830,7 +2843,7 @@ class Dubber:
             
             # Save updated subtitles JSON database permanently as well
             try:
-                subtitles_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles")
+                subtitles_dir = get_subtitles_dir()
                 os.makedirs(subtitles_dir, exist_ok=True)
                 subtitles_json_path = os.path.join(subtitles_dir, f"{video_id}.json")
                 with open(subtitles_json_path, "w", encoding="utf-8") as sf:
@@ -2899,7 +2912,7 @@ class Dubber:
         os.makedirs(self.temp_dir, exist_ok=True)
         
         temp_audio = os.path.join(self.temp_dir, "original_audio.wav")
-        subtitles_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles")
+        subtitles_dir = get_subtitles_dir()
         seg_preview_dir = os.path.join(subtitles_dir, str(video_id))
         os.makedirs(seg_preview_dir, exist_ok=True)
         
@@ -3137,7 +3150,7 @@ class Dubber:
             if not any_bg_enabled:
                 bg_mixed = AudioSegment.silent(duration=original_duration_ms)
             else:
-                bg_mixed_wav_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitles", str(video_id), "bg_mixed.wav")
+                bg_mixed_wav_path = os.path.join(get_subtitles_dir(), str(video_id), "bg_mixed.wav")
                 if os.path.exists(bg_mixed_wav_path):
                     try:
                         bg_mixed = AudioSegment.from_wav(bg_mixed_wav_path)
