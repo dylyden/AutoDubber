@@ -1,0 +1,11 @@
+{
+    "pythonPath": "C:\\Users\\Den\\AppData\\Local\\Programs\\Python\\Python310\\python.exe",
+    "extraPaths": [
+        "C:\\Users\\Den\\AppData\\Local\\Programs\\Python\\Python310\\lib\\site-packages",
+        "C:\\Users\\Den\\AppData\\Roaming\\Python\\Python310\\site-packages"
+    ],
+    "reportMissingImports": false,
+    "reportMissingTypeStubs": false,
+    "reportGeneralTypeIssues": false,
+    "reportOptionalMemberAccess": false
+}
