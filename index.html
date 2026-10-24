@@ -1,0 +1,985 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DenZin Auto-Dubber v2.2</title>
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&family=Kantumruy+Pro:wght@300;400;500;600;700&display=swap"
+        rel="stylesheet">
+    <!-- FontAwesome for Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <!-- Activation Modal (KeyAuth) -->
+    <div id="activation-modal" class="modal-overlay" style="display: none;">
+        <div class="activation-card">
+            <div class="activation-header">
+                <i class="fa-solid fa-shield-halved auth-icon"></i>
+                <h2>Activate DenZin Auto-Dubber</h2>
+                <p>សូមវាយបញ្ចូល License Key ជាមុនទើបអាចប្រើប្រាស់បាន</p>
+            </div>
+            <div class="activation-body">
+                <div class="input-group">
+                    <label for="license-key-input">License Key</label>
+                    <input type="text" id="license-key-input" placeholder="XXXX-XXXX-XXXX-XXXX" autocomplete="off">
+                </div>
+                <div id="activation-error" class="activation-error" style="display: none;">
+                    <i class="fa-solid fa-circle-exclamation"></i> <span id="activation-error-text">Invalid Key</span>
+                </div>
+                <button class="btn btn-primary btn-block btn-activate" id="btn-activate">
+                    <i class="fa-solid fa-unlock"></i> Activate Now
+                </button>
+            </div>
+            <div class="activation-footer">
+                <p>មិនទាន់មាន Key មែនទេ? <a href="https://www.facebook.com/bong.den.92372" target="_blank">ចុចទាក់ទង Admin ទិញ Key</a></p>
+            </div>
+        </div>
+    </div>
+
+    <div class="app-container">
+        <!-- Main Workspace Grid -->
+        <main class="app-workspace">
+            <!-- Left Panel: Queue & Logs -->
+            <div class="panel-left">
+                <!-- Video Queue Panel -->
+                <section class="panel video-queue-panel">
+                    <div class="panel-header">
+                        <h2 class="panel-title"><i class="fa-solid fa-list-check"></i> VIDEO QUEUE</h2>
+                        <div class="license-status-badge" id="license-status-badge" style="display: none; background: rgba(79, 172, 254, 0.1); color: #4facfe; padding: 6px 15px; border-radius: 20px; font-size: 13px; font-weight: 600; border: 1px solid rgba(79, 172, 254, 0.3); margin-left: auto; margin-right: 20px;">
+                            <i class="fa-solid fa-clock"></i> <span id="license-days-text">License: -- Days Left</span>
+                        </div>
+                        <div class="queue-actions">
+                            <button class="btn btn-primary btn-sm" id="btn-add-files">
+                                <i class="fa-solid fa-plus"></i> Add Files
+                            </button>
+                            <button class="btn btn-primary btn-sm" id="btn-add-folder">
+                                <i class="fa-solid fa-folder-plus"></i> Add Folder
+                            </button>
+
+                            <button class="btn btn-danger-outline btn-sm" id="btn-retry-errors">
+                                <i class="fa-solid fa-triangle-exclamation"></i> Retry Errors
+                            </button>
+                            <button class="btn btn-success-outline btn-sm" id="btn-remove-completed">
+                                <i class="fa-solid fa-trash-can"></i> Remove Completed
+                            </button>
+                            <button class="btn btn-danger btn-sm" id="btn-clear-all">
+                                <i class="fa-solid fa-xmark"></i> Clear All
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Drag & Drop Overlay Zone -->
+                    <div class="queue-table-container" id="drop-zone">
+                        <div class="drag-overlay" id="drag-overlay">
+                            <i class="fa-solid fa-cloud-arrow-up drag-icon"></i>
+                            <p>Drop video files here to add to queue</p>
+                        </div>
+                        <div class="empty-state" id="empty-state">
+                            <i class="fa-solid fa-clapperboard empty-icon"></i>
+                            <h3>No videos in queue</h3>
+                            <p>Drag and drop files here, or use the "Add Files" buttons to start.</p>
+                        </div>
+                        <table class="queue-table" id="queue-table" style="display: none;">
+                            <thead>
+                                <tr>
+                                    <th width="40px"><input type="checkbox" id="select-all-videos"></th>
+                                    <th>VIDEO NAME</th>
+                                    <th>SOURCE PATH</th>
+                                    <th width="150px">PROGRESS</th>
+                                    <th width="180px">STATUS</th>
+                                    <th width="50px"></th>
+                                </tr>
+                            </thead>
+                            <tbody id="queue-tbody">
+                                <!-- Dynamic rows will be inserted here -->
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <!-- Queue Status Footer -->
+                    <div class="queue-footer">
+                        <div class="filters">
+                            <span>Filters:</span>
+                            <span class="badge badge-error" id="filter-error">ERROR: 0</span>
+                            <span class="badge badge-success" id="filter-completed">COMPLETED: 0</span>
+                            <span class="badge badge-warning" id="filter-total">TOTAL: 0</span>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Engine Telemetry Logs Panel -->
+                <section class="panel logs-panel">
+                    <div class="panel-header">
+                        <h2 class="panel-title"><i class="fa-solid fa-terminal"></i> ENGINE TELEMETRY LOGS</h2>
+                        <button class="btn btn-sm btn-secondary" id="btn-clear-logs">
+                            <i class="fa-solid fa-eraser"></i> Clear Logs
+                        </button>
+                    </div>
+                    <div class="logs-console" id="logs-console">
+                        <div class="log-line text-success">[SUCCESS] SYSTEM INITIALIZED. READY TO PROCESS.</div>
+                        <div class="log-line text-warning">Awaiting video input and API configuration...</div>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Right Panel: Configurations -->
+            <div class="panel-right">
+                <!-- 1. General Settings -->
+                <section class="config-section">
+                    <h3 class="config-section-title" style="font-size: 15px;">1. ការកំណត់ទូទៅ (API)</h3>
+                    <div class="config-row-group">
+                        <div class="radio-group" style="display: flex; gap: 8px; justify-content: space-between;">
+                            <label class="radio-label">
+                                <input type="radio" name="api-type" value="free" checked>
+                                <span class="radio-custom"></span>
+                                <span>Gemini<br>(Free Pool)</span>
+                            </label>
+                            <label class="radio-label">
+                                <input type="radio" name="api-type" value="vertex">
+                                <span class="radio-custom"></span>
+                                <span>Vertex<br>($300 Profile)</span>
+                            </label>
+                            <label class="radio-label">
+                                <input type="radio" name="api-type" value="groq">
+                                <span class="radio-custom"></span>
+                                <span>Groq<br>(Free 120B/27B)</span>
+                            </label>
+                        </div>
+                        <div class="button-row" style="display: flex; flex-direction: column; gap: 12px;">
+                            <button class="btn btn-outline" id="btn-manage-keys" style="padding: 12px 12px 12px 24px; font-size: 15px; justify-content: flex-start;">
+                                <i class="fa-solid fa-key" style="margin-right: 12px; width: 20px; text-align: center;"></i> Manage Keys
+                            </button>
+                            <button class="btn btn-outline" id="btn-config-api" style="padding: 12px 12px 12px 24px; font-size: 15px; justify-content: flex-start;">
+                                <i class="fa-solid fa-gear" style="margin-right: 12px; width: 20px; text-align: center;"></i> Config API
+                            </button>
+                            <button class="btn btn-outline" id="btn-open-updates" style="padding: 12px 12px 12px 24px; font-size: 15px; justify-content: flex-start; border-color: rgba(79, 172, 254, 0.4);">
+                                <i class="fa-solid fa-cloud-arrow-down" style="margin-right: 12px; width: 20px; text-align: center; color: #4facfe;"></i> Check for Updates
+                            </button>
+                            <button class="btn btn-success-outline" id="btn-save-settings"
+                                style="width: 100%; padding: 12px 12px 12px 24px; font-size: 1.05em; justify-content: flex-start;">
+                                <i class="fa-solid fa-save"
+                                    style="margin-right: 12px; width: 20px; text-align: center;"></i> <span
+                                    style="font-size: 15px;">រក្សាទុកការកែប្រែផ្សេងៗ</span>
+                            </button>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 2. Output Destination -->
+                <section class="config-section">
+                    <h3 class="config-section-title" style="font-size: 15px;">2. ជ្រើសរើសទីតាំង Video ដែលកាត់រួច</h3>
+                    <div class="config-row-group">
+                        <div class="radio-group vertical">
+                            <label class="radio-label" style="font-size: 16px;">
+                                <input type="radio" name="output-type" value="auto" checked>
+                                <span class="radio-custom"></span>
+                                ទីតាំងកន្លែងដើមរបស់ Video
+                            </label>
+                            <label class="radio-label" style="font-size: 16px;">
+                                <input type="radio" name="output-type" value="custom">
+                                <span class="radio-custom"></span>
+                                ជ្រើសរើសទីតាំងថ្មី
+                            </label>
+                        </div>
+                        <div class="output-path-selector" id="custom-path-container" style="display: none;">
+                            <span class="path-display" id="output-path-text">Path: Not Selected</span>
+                            <button class="btn btn-sm btn-secondary" id="btn-select-output">Browse...</button>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 3. Engine Configuration -->
+                <section class="config-section">
+                    <h3 class="config-section-title" style="font-size: 15px;">3. កំណត់ប្រព័ន្ធរបស់ Tool</h3>
+                    <div class="config-grid">
+                        <div class="select-field">
+                            <label>AI Model</label>
+                            <select id="select-model">
+                                <optgroup label="⚡ Groq Cloud (Free LPU - $0)">
+                                    <option value="openai/gpt-oss-120b" selected>GPT-OSS 120B (Flagship 120B - Top Logic)</option>
+                                    <option value="qwen/qwen3.8-27b">Qwen 3.8 27B (Recommended - Top Asian/Khmer Translation)</option>
+                                    <option value="openai/gpt-oss-20b">GPT-OSS 20B (Ultra Fast)</option>
+                                </optgroup>
+                                <optgroup label="🌐 Gemini Models">
+                                    <option value="gemini-2.5-flash" selected>Gemini 2.5 Flash (Recommended - High Quota)</option>
+                                    <option value="gemini-3.6-flash">Gemini 3.6 Flash (Fastest)</option>
+                                    <option value="gemini-3.5-flash">Gemini 3.5 Flash</option>
+                                    <option value="gemini-3.1-flash-lite">Gemini 3.1 Flash Lite</option>
+                                    <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
+                                    <option value="gemini-3.6-pro">Gemini 3.6 Pro</option>
+                                </optgroup>
+                            </select>
+                        </div>
+
+
+                        <div class="select-field">
+                            <label style="font-size: 15px;">ចង់បកប្រែឲ្យទៅជាភាសាអ្វី?</label>
+                            <select id="select-target-lang">
+                                <optgroup label="🇰🇭 ភាសាដើម (Primary)">
+                                    <option value="km-KH" selected>Khmer (Cambodia - ភាសាខ្មែរ)</option>
+                                </optgroup>
+                                <optgroup label="💰 YouTube High RPM (សហរដ្ឋអាមេរិក & អឺរ៉ុប - High CPM Tier 1)">
+                                    <option value="en-US">English (United States) - Top RPM 🚀</option>
+                                    <option value="en-GB">English (United Kingdom) - Top RPM 🚀</option>
+                                    <option value="de-DE">German (Germany - Deutsch) - Top RPM 🚀</option>
+                                    <option value="fr-FR">French (France - Français) - Top RPM 🚀</option>
+                                    <option value="nl-NL">Dutch (Netherlands - Nederlands) - Top RPM 🚀</option>
+                                    <option value="es-ES">Spanish (Spain - Español) - High RPM</option>
+                                    <option value="it-IT">Italian (Italy - Italiano) - High RPM</option>
+                                    <option value="pt-BR">Portuguese (Brazil - Português)</option>
+                                </optgroup>
+                                <optgroup label="🌏 អាស៊ីអាគ្នេយ៍ (Southeast Asia)">
+                                    <option value="th-TH">Thai (Thailand - ภาษาไทย) ★</option>
+                                    <option value="my-MM">Myanmar / Burmese (မြန်မာဘာသာ) ★</option>
+                                    <option value="vi-VN">Vietnamese (Tiếng Việt)</option>
+                                    <option value="id-ID">Indonesian (Bahasa Indonesia)</option>
+                                    <option value="fil-PH">Filipino / Tagalog (Wikang Filipino)</option>
+                                </optgroup>
+                                <optgroup label="🎌 អាស៊ីបូព៌ា (East Asia - High RPM)">
+                                    <option value="ja-JP">Japanese (Japan - 日本語) - Top Asian RPM 🚀</option>
+                                    <option value="ko-KR">Korean (South Korea - 한국어) - High RPM</option>
+                                    <option value="zh-CN">Chinese (Mandarin - 简体中文)</option>
+                                </optgroup>
+                            </select>
+                        </div>
+
+                        <!-- YouTube Multi-Audio Tracks Option -->
+                        <div class="select-field full-width-field" id="youtube-multi-audio-container" style="grid-column: 1 / -1; background: rgba(255, 0, 0, 0.04); border: 1px solid rgba(255, 60, 60, 0.25); border-radius: 10px; padding: 14px 18px; margin-top: 6px; margin-bottom: 6px;">
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                                <label class="checkbox-label" style="font-weight: 600; font-size: 15px; color: #ff6b6b; margin: 0; cursor: pointer; display: flex; align-items: center; gap: 8px;">
+                                    <input type="checkbox" id="chk-youtube-multi-audio">
+                                    <span class="checkbox-custom"></span>
+                                    <i class="fa-brands fa-youtube" style="font-size: 18px; color: #ff3333;"></i> បន្ថែម YouTube Audio Tracks (.m4a Stems)
+                                </label>
+                                <span class="badge" style="background: rgba(255, 0, 0, 0.15); color: #ff9999; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 6px; border: 1px solid rgba(255, 0, 0, 0.3);">OPTIONAL</span>
+                            </div>
+                            <div style="font-size: 13px; color: #999; margin-bottom: 12px; line-height: 1.4;">
+                                បង្កើត Video ដើមតែ 1 (ភាសា Primary) និងផលិត File សំឡេង <strong>.m4a</strong> ពេញលេញ (BGM + Translated Speech) តាមភាសាដែលបានជ្រើសរើស សម្រាប់ Upload ចូល YouTube Studio Audio Track ដោយមិនបាច់ Render Video ឡើងវិញឡើយ។
+                            </div>
+                            <div id="youtube-languages-panel" style="display: none; padding-top: 10px; border-top: 1px dashed rgba(255, 255, 255, 0.12);">
+                                <label style="font-size: 13px; color: #ddd; font-weight: 500; display: block; margin-bottom: 6px;">
+                                    ជ្រើសរើសភាសាបន្ថែម (Select Extra Languages):
+                                </label>
+
+                                <div class="yt-dropdown-wrapper" id="yt-dropdown-wrapper">
+                                    <button type="button" class="yt-dropdown-trigger" id="yt-dropdown-trigger" aria-haspopup="true" aria-expanded="false">
+                                        <span class="yt-trigger-content">
+                                            <i class="fa-solid fa-layer-group" style="color: #ff4d4d; font-size: 14px;"></i>
+                                            <span id="yt-dropdown-label" style="font-weight: 500;">ជ្រើសរើសភាសាបន្ថែម (0 ភាសាត្រូវបានជ្រើសរើស)</span>
+                                        </span>
+                                        <span class="yt-trigger-right">
+                                            <span class="badge" id="yt-selected-count-badge" style="background: rgba(255, 60, 60, 0.2); color: #ff9999; font-size: 11px; padding: 2px 7px; border-radius: 10px; display: none;">0</span>
+                                            <i class="fa-solid fa-chevron-down yt-chevron"></i>
+                                        </span>
+                                    </button>
+
+                                    <div class="yt-dropdown-menu" id="yt-dropdown-menu">
+                                        <div class="yt-dropdown-toolbar">
+                                            <div class="yt-search-container">
+                                                <i class="fa-solid fa-magnifying-glass yt-search-icon"></i>
+                                                <input type="text" id="yt-lang-search" class="yt-search-input" placeholder="Search language... (e.g. English, Thai, 日本語)">
+                                            </div>
+                                            <div class="yt-toolbar-actions">
+                                                <button type="button" class="btn btn-sm btn-secondary" id="btn-yt-select-all" style="padding: 3px 10px; font-size: 11px;">Select All</button>
+                                                <button type="button" class="btn btn-sm btn-secondary" id="btn-yt-clear-all" style="padding: 3px 10px; font-size: 11px;">Clear All</button>
+                                            </div>
+                                        </div>
+
+                                        <div class="yt-dropdown-list" id="yt-dropdown-list">
+                                            <label class="yt-lang-item checkbox-label" data-lang-name="English US" data-lang-native="English (US)">
+                                                <input type="checkbox" class="chk-yt-lang" value="en-US">
+                                                <span class="checkbox-custom"></span>
+                                                <span>🇺🇸 English (US)</span>
+                                            </label>
+                                            <label class="yt-lang-item checkbox-label" data-lang-name="Spanish" data-lang-native="Español">
+                                                <input type="checkbox" class="chk-yt-lang" value="es-ES">
+                                                <span class="checkbox-custom"></span>
+                                                <span>🇪🇸 Spanish (Español)</span>
+                                            </label>
+                                            <label class="yt-lang-item checkbox-label" data-lang-name="Thai" data-lang-native="ภาษาไทย">
+                                                <input type="checkbox" class="chk-yt-lang" value="th-TH">
+                                                <span class="checkbox-custom"></span>
+                                                <span>🇹🇭 Thai (ภาษาไทย)</span>
+                                            </label>
+                                            <label class="yt-lang-item checkbox-label" data-lang-name="Japanese" data-lang-native="日本語">
+                                                <input type="checkbox" class="chk-yt-lang" value="ja-JP">
+                                                <span class="checkbox-custom"></span>
+                                                <span>🇯🇵 Japanese (日本語)</span>
+                                            </label>
+                                            <label class="yt-lang-item checkbox-label" data-lang-name="Korean" data-lang-native="한국어">
+                                                <input type="checkbox" class="chk-yt-lang" value="ko-KR">
+                                                <span class="checkbox-custom"></span>
+                                                <span>🇰🇷 Korean (한국어)</span>
+                                            </label>
+                                            <label class="yt-lang-item checkbox-label" data-lang-name="German" data-lang-native="Deutsch">
+                                                <input type="checkbox" class="chk-yt-lang" value="de-DE">
+                                                <span class="checkbox-custom"></span>
+                                                <span>🇩🇪 German (Deutsch)</span>
+                                            </label>
+                                            <label class="yt-lang-item checkbox-label" data-lang-name="French" data-lang-native="Français">
+                                                <input type="checkbox" class="chk-yt-lang" value="fr-FR">
+                                                <span class="checkbox-custom"></span>
+                                                <span>🇫🇷 French (Français)</span>
+                                            </label>
+                                            <label class="yt-lang-item checkbox-label" data-lang-name="Portuguese" data-lang-native="Português Brasil">
+                                                <input type="checkbox" class="chk-yt-lang" value="pt-BR">
+                                                <span class="checkbox-custom"></span>
+                                                <span>🇧🇷 Portuguese (Brasil)</span>
+                                            </label>
+                                            <label class="yt-lang-item checkbox-label" data-lang-name="Italian" data-lang-native="Italiano">
+                                                <input type="checkbox" class="chk-yt-lang" value="it-IT">
+                                                <span class="checkbox-custom"></span>
+                                                <span>🇮🇹 Italian (Italiano)</span>
+                                            </label>
+                                            <label class="yt-lang-item checkbox-label" data-lang-name="Dutch" data-lang-native="Nederlands">
+                                                <input type="checkbox" class="chk-yt-lang" value="nl-NL">
+                                                <span class="checkbox-custom"></span>
+                                                <span>🇳🇱 Dutch (Nederlands)</span>
+                                            </label>
+                                            <label class="yt-lang-item checkbox-label" data-lang-name="Chinese" data-lang-native="Mandarin 简体中文">
+                                                <input type="checkbox" class="chk-yt-lang" value="zh-CN">
+                                                <span class="checkbox-custom"></span>
+                                                <span>🇨🇳 Chinese (Mandarin)</span>
+                                            </label>
+                                            <label class="yt-lang-item checkbox-label" data-lang-name="Vietnamese" data-lang-native="Tiếng Việt">
+                                                <input type="checkbox" class="chk-yt-lang" value="vi-VN">
+                                                <span class="checkbox-custom"></span>
+                                                <span>🇻🇳 Vietnamese (Tiếng Việt)</span>
+                                            </label>
+                                            <label class="yt-lang-item checkbox-label" data-lang-name="Indonesian" data-lang-native="Bahasa Indonesia">
+                                                <input type="checkbox" class="chk-yt-lang" value="id-ID">
+                                                <span class="checkbox-custom"></span>
+                                                <span>🇮🇩 Indonesian (Bahasa)</span>
+                                            </label>
+                                            <label class="yt-lang-item checkbox-label" data-lang-name="Filipino Tagalog" data-lang-native="Wikang Filipino">
+                                                <input type="checkbox" class="chk-yt-lang" value="fil-PH">
+                                                <span class="checkbox-custom"></span>
+                                                <span>🇵🇭 Filipino (Tagalog)</span>
+                                            </label>
+                                            <label class="yt-lang-item checkbox-label" data-lang-name="Myanmar Burmese" data-lang-native="မြန်မာဘာသာ">
+                                                <input type="checkbox" class="chk-yt-lang" value="my-MM">
+                                                <span class="checkbox-custom"></span>
+                                                <span>🇲🇲 Myanmar (Burmese)</span>
+                                            </label>
+                                            <label class="yt-lang-item checkbox-label" data-lang-name="English UK" data-lang-native="English (UK)">
+                                                <input type="checkbox" class="chk-yt-lang" value="en-GB">
+                                                <span class="checkbox-custom"></span>
+                                                <span>🇬🇧 English (UK)</span>
+                                            </label>
+                                            <label class="yt-lang-item checkbox-label" data-lang-name="Khmer" data-lang-native="ភាសាខ្មែរ">
+                                                <input type="checkbox" class="chk-yt-lang" value="km-KH">
+                                                <span class="checkbox-custom"></span>
+                                                <span>🇰🇭 Khmer (ភាសាខ្មែរ)</span>
+                                            </label>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="select-field">
+                            <label style="font-size: 15px;">កំណត់ភេទរបស់សំឡេង</label>
+                            <select id="select-gender">
+                                <option value="auto" selected>Auto Detected Gender</option>
+                                <option value="male">Male (Standard)</option>
+                                <option value="female">Female (Standard)</option>
+                            </select>
+                        </div>
+
+                        <div class="select-field" style="display: none;">
+                            <label>TTS Synthesis Engine</label>
+                            <select id="select-tts-engine">
+                                <option value="voxcpm2" selected>VoxCPM2 (Local Offline Model)</option>
+                            </select>
+                        </div>
+
+
+                        <!-- 1. Ultimate Clone Checkbox (Red #1) -->
+                        <div class="select-field" id="voxcpm-ultimate-clone-container">
+                            <label class="checkbox-label" style="font-weight: 500; font-size: 15px;">
+                                <input type="checkbox" id="chk-voxcpm-ultimate-clone" checked>
+                                <span class="checkbox-custom"></span>
+                                Clone សំឡេងឲ្យដូចសំឡេងគំរូ (Transcript-Guided)
+                            </label>
+                        </div>
+
+                        <!-- 2. VoxCPM CFG Similarity Slider (Red #2) -->
+                        <div class="select-field" id="voxcpm-cfg-container">
+                            <div
+                                style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                                <label style="margin: 0; font-size: 15px;">ចង់ឲ្យដូចសំឡេងគំរូខ្លាំងប៉ុណ្ណា?</label>
+                                <span class="stem-vol-badge" id="voxcpm-cfg-badge">3.0</span>
+                            </div>
+                            <input type="range" id="input-voxcpm-cfg" min="1.0" max="3.0" step="0.1" value="3.0"
+                                class="stem-vol-slider">
+                        </div>
+
+                        <!-- 3. Max Speech Speed Slider (Red #3) -->
+                        <div class="select-field" id="speech-speed-container">
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                                <label style="margin: 0; font-size: 15px;">កំណត់ល្បឿននិយាយអតិបរមា (Max Speech Speed)</label>
+                                <span class="stem-vol-badge" id="speech-speed-badge">1.3x</span>
+                            </div>
+                            <input type="range" id="input-max-speech-speed" min="1.0" max="2.0" step="0.05" value="1.3" class="stem-vol-slider">
+                        </div>
+
+                        <!-- 4. TTS Engine Selector -->
+                        <div class="select-field" id="tts-engine-radio-container" style="grid-column: 1 / -1; background: rgba(255, 255, 255, 0.03); padding: 16px 20px; border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.08); margin-top: 8px; margin-bottom: 8px;">
+                            <label style="font-size: 15px; font-weight: 600; margin-bottom: 12px; display: block; color: var(--gold-color, #f1c40f);">
+                                <i class="fa-solid fa-microphone-lines" style="margin-right: 8px;"></i> ជម្រើសសម្លេង
+                            </label>
+                            <div class="radio-group vertical" style="display: flex; flex-direction: column; gap: 14px;">
+                                <label class="radio-label" style="display: flex; align-items: flex-start; gap: 12px; font-size: 15px; cursor: pointer; line-height: 1.4;">
+                                    <input type="radio" name="tts-engine-radio" value="edge-tts" checked style="display: none;">
+                                    <span class="radio-custom" style="flex-shrink: 0; margin-top: 3px;"></span>
+                                    <span style="display: block;">
+                                        <strong>សម្លេង AI</strong> (Piseth, SreyMom)
+                                    </span>
+                                </label>
+                                <label class="radio-label" style="display: flex; align-items: flex-start; gap: 12px; font-size: 15px; cursor: pointer; line-height: 1.4;">
+                                    <input type="radio" name="tts-engine-radio" value="voxcpm2" style="display: none;">
+                                    <span class="radio-custom" style="flex-shrink: 0; margin-top: 3px;"></span>
+                                    <span style="display: block;">
+                                        <strong>សម្លេងមនុស្សពិត</strong> (VoxCPM)
+                                    </span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <!-- 5. Custom Actor Voice Cloning References (Red #5) -->
+                        <div class="select-field full-width-field" id="voice-cloning-container">
+                            <details class="custom-dropdown-details">
+                                <summary
+                                    style="cursor: pointer; font-size: 0.9em; white-space: nowrap; font-weight: bold; padding: 12px; background: linear-gradient(135deg, var(--accent-gold) 0%, #ca8a04 100%); color: #000; border-radius: var(--radius-sm); border: none; box-shadow: 0 4px 15px rgba(229, 169, 59, 0.3); list-style: none; display: flex; align-items: center; gap: 8px; text-shadow: none;">
+                                    <i class="fa-solid fa-microphone-lines" style="flex-shrink: 0;"></i> <span
+                                        style="overflow: hidden; text-overflow: ellipsis; font-size: 15px;">សំឡេងគំរូរបស់តួ(ប្រុស,ស្រី)</span>
+                                    <i class="fa-solid fa-chevron-down"
+                                        style="margin-left: auto; font-size: 0.8em; flex-shrink: 0;"></i>
+                                </summary>
+                                <div class="voice-ref-grid"
+                                    style="margin-top: 15px; padding: 10px; background: rgba(0,0,0,0.2); border-radius: var(--radius-sm);">
+                                    <div class="voice-ref-item">
+                                        <span class="voice-ref-title" style="font-size: 15px;">👨 សំឡេងតួឯកប្រុស៖</span>
+                                        <div class="path-input-group">
+                                            <span class="path-display-sm" id="male-voice-path-text"
+                                                title="Default Model Voice">Default Male Voice</span>
+                                            <button class="btn btn-xs btn-outline" id="btn-select-male-voice">Browse
+                                                Audio...</button>
+                                            <button class="btn btn-xs btn-icon-only" id="btn-clear-male-voice"
+                                                title="Clear Reference">&times;</button>
+                                        </div>
+                                    </div>
+                                    <div class="voice-ref-item">
+                                        <span class="voice-ref-title" style="font-size: 15px;">👩 សំឡេងតួឯកស្រី៖</span>
+                                        <div class="path-input-group">
+                                            <span class="path-display-sm" id="female-voice-path-text"
+                                                title="Default Model Voice">Default Female Voice</span>
+                                            <button class="btn btn-xs btn-outline" id="btn-select-female-voice">Browse
+                                                Audio...</button>
+                                            <button class="btn btn-xs btn-icon-only" id="btn-clear-female-voice"
+                                                title="Clear Reference">&times;</button>
+                                        </div>
+                                    </div>
+                                    <div class="voice-ref-item">
+                                        <span class="voice-ref-title" style="font-size: 15px;">📖 សំឡេងអ្នកអាន
+                                            (ប្រុស)៖</span>
+                                        <div class="path-input-group">
+                                            <span class="path-display-sm" id="narrator-male-voice-path-text"
+                                                title="Default Model Voice">Default Narrator Male</span>
+                                            <button class="btn btn-xs btn-outline"
+                                                id="btn-select-narrator-male-voice">Browse Audio...</button>
+                                            <button class="btn btn-xs btn-icon-only" id="btn-clear-narrator-male-voice"
+                                                title="Clear Reference">&times;</button>
+                                        </div>
+                                    </div>
+                                    <div class="voice-ref-item">
+                                        <span class="voice-ref-title" style="font-size: 15px;">📖 សំឡេងអ្នកអាន
+                                            (ស្រី)៖</span>
+                                        <div class="path-input-group">
+                                            <span class="path-display-sm" id="narrator-female-voice-path-text"
+                                                title="Default Model Voice">Default Narrator Female</span>
+                                            <button class="btn btn-xs btn-outline"
+                                                id="btn-select-narrator-female-voice">Browse Audio...</button>
+                                            <button class="btn btn-xs btn-icon-only"
+                                                id="btn-clear-narrator-female-voice"
+                                                title="Clear Reference">&times;</button>
+                                        </div>
+                                    </div>
+                                    <div class="voice-ref-item">
+                                        <span class="voice-ref-title" style="font-size: 15px;">👦
+                                            សំឡេងក្មេងប្រុស៖</span>
+                                        <div class="path-input-group">
+                                            <span class="path-display-sm" id="young-male-voice-path-text"
+                                                title="Default Model Voice">Default Child Male Voice</span>
+                                            <button class="btn btn-xs btn-outline"
+                                                id="btn-select-young-male-voice">Browse
+                                                Audio...</button>
+                                            <button class="btn btn-xs btn-icon-only" id="btn-clear-young-male-voice"
+                                                title="Clear Reference">&times;</button>
+                                        </div>
+                                    </div>
+                                    <div class="voice-ref-item">
+                                        <span class="voice-ref-title" style="font-size: 15px;">👧 សំឡេងក្មេងស្រី៖</span>
+                                        <div class="path-input-group">
+                                            <span class="path-display-sm" id="young-female-voice-path-text"
+                                                title="Default Model Voice">Default Child Female Voice</span>
+                                            <button class="btn btn-xs btn-outline"
+                                                id="btn-select-young-female-voice">Browse
+                                                Audio...</button>
+                                            <button class="btn btn-xs btn-icon-only" id="btn-clear-young-female-voice"
+                                                title="Clear Reference">&times;</button>
+                                        </div>
+                                    </div>
+                                    <div class="voice-ref-item">
+                                        <span class="voice-ref-title" style="font-size: 15px;">🧓 សំឡេងមនុស្សចាស់
+                                            (ប្រុស)៖</span>
+                                        <div class="path-input-group">
+                                            <span class="path-display-sm" id="old-male-voice-path-text"
+                                                title="Default Model Voice">Default Elderly Male Voice</span>
+                                            <button class="btn btn-xs btn-outline" id="btn-select-old-male-voice">Browse
+                                                Audio...</button>
+                                            <button class="btn btn-xs btn-icon-only" id="btn-clear-old-male-voice"
+                                                title="Clear Reference">&times;</button>
+                                        </div>
+                                    </div>
+                                    <div class="voice-ref-item">
+                                        <span class="voice-ref-title" style="font-size: 15px;">👵 សំឡេងមនុស្សចាស់
+                                            (ស្រី)៖</span>
+                                        <div class="path-input-group">
+                                            <span class="path-display-sm" id="old-female-voice-path-text"
+                                                title="Default Model Voice">Default Elderly Female Voice</span>
+                                            <button class="btn btn-xs btn-outline"
+                                                id="btn-select-old-female-voice">Browse
+                                                Audio...</button>
+                                            <button class="btn btn-xs btn-icon-only" id="btn-clear-old-female-voice"
+                                                title="Clear Reference">&times;</button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </details>
+                        </div>
+
+                        <!-- 6. Enhance Old Video (Red #6) -->
+                        <div class="select-field full-width-field" id="enhance-video-container">
+                            <details class="custom-dropdown-details">
+                                <summary
+                                    style="cursor: pointer; font-size: 0.9em; white-space: nowrap; font-weight: bold; padding: 12px; background: linear-gradient(135deg, var(--accent-gold) 0%, #ca8a04 100%); color: #000; border-radius: var(--radius-sm); border: none; box-shadow: 0 4px 15px rgba(229, 169, 59, 0.3); list-style: none; display: flex; align-items: center; gap: 8px; text-shadow: none;">
+                                    <i class="fa-solid fa-wand-magic-sparkles" style="flex-shrink: 0;"></i> <span
+                                        style="overflow: hidden; text-overflow: ellipsis; font-size: 15px;">ឆ្នៃបន្ថែមលើ Video ចាស់</span>
+                                    <i class="fa-solid fa-chevron-down"
+                                        style="margin-left: auto; font-size: 0.8em; flex-shrink: 0;"></i>
+                                </summary>
+                                <div class="enhance-video-grid"
+                                    style="margin-top: 15px; padding: 15px; background: rgba(0,0,0,0.2); border-radius: var(--radius-sm); display: flex; flex-direction: column; gap: 15px;">
+                                    
+                                    <!-- Video Speed Adjustment -->
+                                    <div class="enhance-item">
+                                        <label class="checkbox-label enhance-label">
+                                            <input type="checkbox" id="chk-movie-recap">
+                                            <span class="checkbox-custom"></span>
+                                            <span class="enhance-text">មុខងារ សម្រាយរឿង (Movie Recap Mode)</span>
+                                        </label>
+                                    </div>
+
+                                    <div class="enhance-item">
+                                        <label class="checkbox-label enhance-label">
+                                            <input type="checkbox" id="chk-video-speed-adjust">
+                                            <span class="checkbox-custom"></span>
+                                            <span class="enhance-text">ប្ដូរល្បឿនវីដេអូ (Video Speed Adjustment)</span>
+                                        </label>
+                                        <div id="video-speed-options" style="display: none; margin-top: 10px; margin-left: 30px;">
+                                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                                                <label style="margin: 0; font-size: 14px; color: #ccc;">ល្បឿនវីដេអូ (1.0x ជាធម្មតា)</label>
+                                                <span class="stem-vol-badge" id="video-speed-badge">1.0x</span>
+                                            </div>
+                                            <input type="range" id="input-video-speed" min="0.5" max="2.0" step="0.05" value="1.0" class="stem-vol-slider">
+                                        </div>
+                                    </div>
+
+                                    <!-- Color Correction -->
+                                    <div class="enhance-item">
+                                        <label class="checkbox-label enhance-label">
+                                            <input type="checkbox" id="chk-color-correction">
+                                            <span class="checkbox-custom"></span>
+                                            <span class="enhance-text">កែពន្លឺវីដេអូឲ្យច្បាស់ជាងមុន (Color & Clarity Boost)</span>
+                                        </label>
+                                    </div>
+
+                                    </div>
+                            </details>
+                        </div>
+
+                        <div class="mixer-field">
+                            <label style="font-size: 15px;"><i class="fa-solid fa-sliders"></i> កំណត់កម្រិតសំឡេង
+                                Background ដើម</label>
+                            <div class="stem-mixer-container">
+                                <div class="stem-mixer-card">
+                                    <div class="stem-header">
+                                        <label class="checkbox-label" style="font-size: 15px;">
+                                            <input type="checkbox" id="mixer-drums" checked>
+                                            <span class="checkbox-custom"></span>
+                                            សំឡេងស្គរ (Drums)
+                                        </label>
+                                        <span class="stem-vol-badge" id="drums-vol-badge">100%</span>
+                                    </div>
+                                    <input type="range" id="mixer-drums-vol" min="0" max="100" value="100"
+                                        class="stem-vol-slider">
+                                </div>
+                                <div class="stem-mixer-card">
+                                    <div class="stem-header">
+                                        <label class="checkbox-label" style="font-size: 15px;">
+                                            <input type="checkbox" id="mixer-bass" checked>
+                                            <span class="checkbox-custom"></span>
+                                            សំឡេងបាស (Bass)
+                                        </label>
+                                        <span class="stem-vol-badge" id="bass-vol-badge">100%</span>
+                                    </div>
+                                    <input type="range" id="mixer-bass-vol" min="0" max="100" value="100"
+                                        class="stem-vol-slider">
+                                </div>
+                                <div class="stem-mixer-card highlight-stem">
+                                    <div class="stem-header">
+                                        <label class="checkbox-label" style="font-size: 15px;">
+                                            <input type="checkbox" id="mixer-melody" checked>
+                                            <span class="checkbox-custom"></span>
+                                            សំឡេងភ្លេង (Melody)
+                                        </label>
+                                        <span class="stem-vol-badge" id="melody-vol-badge">100%</span>
+                                    </div>
+                                    <input type="range" id="mixer-melody-vol" min="0" max="100" value="100"
+                                        class="stem-vol-slider">
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="select-field">
+                            <label>GPU Processing</label>
+                            <select id="select-gpu">
+                                <option value="auto" selected>Auto GPU Detect (Recommended)</option>
+                                <option value="cuda">Force CUDA (NVIDIA GPU)</option>
+                                <option value="cpu">Force CPU Mode</option>
+                            </select>
+                        </div>
+
+
+                        <div class="select-field">
+                            <label>Concurrent Tasks (Limit)</label>
+                            <select id="select-threads">
+                                <option value="1">1 Task at a time</option>
+                                <option value="2" selected>2 Tasks at a time (Recommended)</option>
+                                <option value="4">4 Tasks at a time</option>
+                                <option value="6">6 Tasks at a time</option>
+                                <option value="8">8 Tasks at a time</option>
+                            </select>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Auto Shutdown Toggle Banner -->
+                <div class="auto-shutdown-container">
+                    <label class="checkbox-label shutdown-label">
+                        <input type="checkbox" id="chk-auto-shutdown">
+                        <span class="checkbox-custom"></span>
+                        <span class="shutdown-text"><i class="fa-solid fa-power-off shutdown-icon"></i> Auto Shutdown PC
+                            when all queue tasks finish</span>
+                    </label>
+                </div>
+
+                <!-- Delete Original Video Toggle Banner -->
+                <div class="auto-shutdown-container delete-original-container">
+                    <label class="checkbox-label shutdown-label">
+                        <input type="checkbox" id="chk-delete-original">
+                        <span class="checkbox-custom"></span>
+                        <span class="shutdown-text"><i class="fa-solid fa-trash-can shutdown-icon"></i> លុបវីដេអូដើមចោលក្រោយ "បក" រួច</span>
+                    </label>
+                </div>
+
+                <!-- Processing Actions -->
+                <div class="action-buttons-group">
+                    <button class="btn btn-danger btn-lg btn-cancel" id="btn-cancel-processing" disabled>
+                        <i class="fa-solid fa-circle-stop"></i> CANCEL
+                    </button>
+                    <button class="btn btn-gold btn-lg btn-process" id="btn-start-processing">
+                        <i class="fa-solid fa-play"></i> START PROCESSING
+                    </button>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- API Key Manager Modal -->
+    <div class="modal-backdrop" id="keys-modal" style="display: none;">
+        <div class="modal">
+            <div class="modal-header">
+                <h3><i class="fa-solid fa-key"></i> API Keys Pool (Gemini & Groq)</h3>
+                <button class="btn-close" id="btn-close-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="modal-desc">Enter your Gemini (AQ... / AIza...) or Groq (gsk_...) API keys below (one per line). The system automatically detects
+                    and identifies key formats and rotates them during batch processing.</p>
+                <textarea id="api-keys-textarea"
+                    placeholder="Paste your Gemini or Groq API keys here...&#10;gsk_AbCdEf123456789... (Groq Free LPU)&#10;AQ.Ab8RN... (Vertex Express Pool)&#10;AIzaSy... (Gemini Free Pool)"
+                    rows="6"></textarea>
+
+                <div class="key-format-inspector">
+                    <div class="inspector-header">
+                        <span class="inspector-title"><i class="fa-solid fa-wand-magic-sparkles"></i> Key Format
+                            Identifier & Health Inspection</span>
+                        <span class="inspector-count" id="inspector-summary">0 Keys Detected</span>
+                    </div>
+                    <div class="inspector-list" id="inspector-list">
+                        <div class="inspector-empty">Paste or type keys above to inspect format and validity...</div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer" style="display: flex; justify-content: space-between; align-items: center;">
+                <div class="api-indicator" style="margin: 0;">
+                    <span class="status-dot green" id="api-status-dot"></span>
+                    <span id="api-status-text">Pool Status: 0 Keys Loaded</span>
+                </div>
+                <div style="display: flex; gap: 12px; align-items: center;">
+                    <button class="btn btn-md btn-outline" id="btn-verify-api"><i class="fa-solid fa-bolt"></i> Verify
+                        API</button>
+                    <button class="btn btn-md btn-secondary" id="btn-cancel-keys"><i class="fa-solid fa-times"></i>
+                        Cancel</button>
+                    <button class="btn btn-md btn-gold" id="btn-save-keys"
+                        style="padding-left: 24px; padding-right: 24px; font-weight: bold;"><i
+                            class="fa-solid fa-check"></i> Save Keys</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Config API Modal -->
+    <div class="modal-backdrop" id="config-modal" style="display: none;">
+        <div class="modal">
+            <div class="modal-header">
+                <h3><i class="fa-solid fa-gear"></i> Config API Setup</h3>
+                <button class="btn-close" id="btn-close-config-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="modal-desc" style="font-size: 1.1em; color: var(--text-color); margin-bottom: 20px;">Configure
+                    your HuggingFace API settings.</p>
+
+                <div class="select-field" id="hf-space-container">
+                    <label style="font-size: 1.1em; font-weight: bold; margin-bottom: 8px;">HuggingFace Space ID</label>
+                    <input type="text" id="input-hf-space" value="dylyden/VoxCPM-Demo" placeholder="dylyden/VoxCPM-Demo"
+                        class="form-input-sm" style="padding: 14px; font-size: 1.1em; border-radius: 6px; width: 100%;">
+                </div>
+
+                <div class="select-field" id="hf-token-container">
+                    <label style="font-size: 1.1em; font-weight: bold; margin-bottom: 8px;">HuggingFace Token</label>
+                    <input type="password" id="input-hf-token" placeholder="hf_xxxxxxxxxxxxxxxxx" class="form-input-sm"
+                        style="padding: 14px; font-size: 1.1em; border-radius: 6px; width: 100%;">
+                </div>
+
+            </div>
+            <div class="modal-footer" style="display: flex; justify-content: flex-end; align-items: center;">
+                <div style="display: flex; gap: 12px; align-items: center;">
+                    <button class="btn btn-md btn-secondary" id="btn-cancel-config"><i class="fa-solid fa-times"></i>
+                        Close</button>
+                    <button class="btn btn-md btn-gold" id="btn-done-config"
+                        style="padding-left: 24px; padding-right: 24px; font-weight: bold;"><i
+                            class="fa-solid fa-check"></i> Done</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- System & Engine Updates Modal -->
+    <div class="modal-backdrop" id="updates-modal" style="display: none;">
+        <div class="modal" style="max-width: 580px; width: 90%;">
+            <div class="modal-header">
+                <h3><i class="fa-solid fa-cloud-arrow-down" style="color: #4facfe;"></i> System & Engine Updates</h3>
+                <button class="btn-close" id="btn-close-updates-modal">&times;</button>
+            </div>
+            <div class="modal-body" style="padding: 20px 24px;">
+                <!-- Version Overview Grid -->
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px;">
+                    <div style="background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px; padding: 14px;">
+                        <div style="font-size: 12px; color: #888; text-transform: uppercase; font-weight: 600; margin-bottom: 4px;">App Engine</div>
+                        <div style="font-size: 18px; font-weight: 700; color: #fff;" id="update-app-ver-display">v2.1.0</div>
+                        <div style="margin-top: 6px;" id="update-app-badge"><span class="badge badge-success" style="font-size: 11px;">Active</span></div>
+                    </div>
+                    <div style="background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px; padding: 14px;">
+                        <div style="font-size: 12px; color: #888; text-transform: uppercase; font-weight: 600; margin-bottom: 4px;">Edge-TTS Engine</div>
+                        <div style="font-size: 18px; font-weight: 700; color: #4facfe;" id="update-edge-ver-display">v7.3.1</div>
+                        <div style="margin-top: 6px;" id="update-edge-badge"><span class="badge badge-success" style="font-size: 11px;">Handshake Verified</span></div>
+                    </div>
+                </div>
+
+                <!-- Channel 1: Microsoft Edge TTS Live Patcher -->
+                <div style="background: rgba(79, 172, 254, 0.06); border: 1px solid rgba(79, 172, 254, 0.2); border-radius: 8px; padding: 16px; margin-bottom: 16px;">
+                    <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px;">
+                        <div>
+                            <div style="font-weight: 600; font-size: 15px; color: #4facfe;"><i class="fa-solid fa-bolt"></i> Edge-TTS Live Patcher</div>
+                            <div style="font-size: 12px; color: #aaa; margin-top: 4px;">Pulls official protocol handshake updates from PyPI into plugins without recompiling.</div>
+                        </div>
+                        <button class="btn btn-sm btn-primary" id="btn-update-edge-tts" style="white-space: nowrap; margin-left: 10px;">
+                            <i class="fa-solid fa-arrows-rotate"></i> Update TTS Now
+                        </button>
+                    </div>
+                    <div id="edge-update-status" style="font-size: 12px; color: #bbb; margin-top: 6px; display: none;"></div>
+                </div>
+
+                <!-- Channel 2: GitHub Core & UI Update -->
+                <div style="background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px; padding: 16px; margin-bottom: 16px;">
+                    <div style="font-weight: 600; font-size: 15px; color: #fff; margin-bottom: 8px;"><i class="fa-brands fa-github"></i> Core Engine & UI Updates</div>
+                    <div style="font-size: 12px; color: #aaa; margin-bottom: 12px;">Fetch translation prompts, model connectors, and UI patches from GitHub.</div>
+                    
+                    <div style="display: flex; gap: 8px; margin-bottom: 10px;">
+                        <input type="text" id="input-github-repo" placeholder="e.g. your-github-user/AutoDubber" class="form-input-sm" style="flex: 1; padding: 10px 12px; font-size: 13px; border-radius: 6px;">
+                        <button class="btn btn-sm btn-secondary" id="btn-save-gh-repo" title="Save Repository">
+                            <i class="fa-solid fa-floppy-disk"></i> Save
+                        </button>
+                    </div>
+                    <button class="btn btn-sm btn-outline" id="btn-check-github-update" style="width: 100%; justify-content: center;">
+                        <i class="fa-solid fa-magnifying-glass"></i> Check GitHub for Releases
+                    </button>
+                    <div id="github-update-status" style="font-size: 12px; color: #bbb; margin-top: 8px; display: none;"></div>
+                </div>
+
+                <!-- Live Update Log Console -->
+                <div id="update-log-box" style="display: none; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 10px 12px; font-family: monospace; font-size: 12px; color: #58a6ff; max-height: 120px; overflow-y: auto;">
+                </div>
+            </div>
+            <div class="modal-footer" style="display: flex; justify-content: space-between; align-items: center;">
+                <button class="btn btn-sm btn-outline" id="btn-check-all-updates">
+                    <i class="fa-solid fa-arrows-rotate"></i> Refresh All Status
+                </button>
+                <button class="btn btn-md btn-secondary" id="btn-close-updates-done"><i class="fa-solid fa-times"></i> Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Subtitle & Timeline Editor Modal -->
+    <div class="modal-backdrop" id="editor-modal" style="display: none;">
+        <div class="modal modal-fullscreen">
+            <div class="modal-header"
+                style="display: flex; align-items: center; justify-content: space-between; gap: 15px;">
+                <h3><i class="fa-solid fa-film"></i> Subtitle & Timeline Editor - <span id="editor-video-title">Video
+                        Name</span></h3>
+                <div class="editor-header-actions"
+                    style="margin-left: auto; display: flex; gap: 8px; align-items: center;">
+                    <button class="btn btn-secondary" id="btn-cancel-editor">Cancel & Close</button>
+
+                    <button class="btn btn-gold-solid" id="btn-save-redub-editor">
+                        <i class="fa-solid fa-play"></i> Save & Re-Dub Video
+                    </button>
+                </div>
+                <button class="btn-close" id="btn-close-editor">&times;</button>
+            </div>
+            <div class="modal-body editor-workspace">
+                <div class="editor-main-panel">
+                    <!-- Left: Video Preview -->
+                    <div class="editor-video-column">
+                        <div class="video-preview-wrapper">
+                            <video id="editor-video" controls width="100%"></video>
+                        </div>
+                        <div class="video-controls-info">
+                            <div class="info-row">
+                                <span>Current Time:</span>
+                                <strong id="editor-current-time">00:00.00</strong>
+                            </div>
+                            <div class="info-row">
+                                <span>Duration:</span>
+                                <strong id="editor-duration">00:00.00</strong>
+                            </div>
+                        </div>
+                        <div class="editor-keyboard-hints">
+                            <h4>Keyboard Shortcuts</h4>
+                            <ul>
+                                <li><code>Space</code>: Play / Pause Video</li>
+                                <li><code>Esc</code>: Close Editor</li>
+                            </ul>
+                        </div>
+                    </div>
+
+                    <!-- Right: Subtitle Data Table -->
+                    <div class="editor-table-column">
+                        <div class="panel-header table-actions-header">
+                            <h4 class="sub-panel-title"><i class="fa-solid fa-file-signature"></i> Subtitle Dialogue
+                                Data</h4>
+                            <div class="table-actions">
+                                <button class="btn btn-primary btn-xs" id="editor-btn-add-row">
+                                    <i class="fa-solid fa-plus"></i> Add Row
+                                </button>
+                                <button class="btn btn-danger-outline btn-xs" id="editor-btn-delete-selected">
+                                    <i class="fa-solid fa-trash"></i> Delete Selected
+                                </button>
+                            </div>
+                        </div>
+                        <div class="editor-table-container">
+                            <table class="editor-table">
+                                <thead>
+                                    <tr>
+                                        <th width="30px"><input type="checkbox" id="editor-select-all"></th>
+                                        <th width="50px">#</th>
+                                        <th width="90px">Start (s)</th>
+                                        <th width="90px">End (s)</th>
+                                        <th>Translated Khmer Text (Editable)</th>
+                                        <th width="200px">Audio / Voice</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="editor-tbody">
+                                    <!-- Dynamic rows will be inserted here -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Bottom: Visual Timeline Editor -->
+                <div class="editor-timeline-panel">
+                    <div class="timeline-header">
+                        <h4 class="sub-panel-title"><i class="fa-solid fa-wave-square"></i> Timeline Waveform & Track
+                            Editor</h4>
+                    </div>
+                    <div class="timeline-workspace" id="timeline-workspace">
+                        <!-- Playhead indicator -->
+                        <div class="timeline-playhead" id="timeline-playhead"></div>
+
+                        <!-- Rulers / Time stamps -->
+                        <div class="timeline-ruler" id="timeline-ruler">
+                            <!-- Ruler tick marks will be rendered here dynamically -->
+                        </div>
+
+                        <!-- Tracks -->
+                        <div class="timeline-tracks">
+                            <!-- T1 Subtitle blocks -->
+                            <div class="timeline-track" id="track-subtitles">
+                                <div class="track-label">T1</div>
+                                <div class="track-content" id="track-subtitles-content">
+                                    <!-- Subtitle block divs will be inserted here dynamically -->
+                                </div>
+                            </div>
+                            <!-- A1 Audio Waveform -->
+                            <div class="timeline-track" id="track-audio">
+                                <div class="track-label">A1</div>
+                                <div class="track-content" id="track-audio-content">
+                                    <!-- Waveform visualizer will be drawn here dynamically -->
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <!-- Footer actions moved to header -->
+        </div>
+    </div>
+
+    <!-- Invisible File Inputs for Custom Browsing -->
+    <input type="file" id="file-input" multiple style="display: none;" accept="video/*">
+    <input type="file" id="folder-input" webkitdirectory directory multiple style="display: none;">
+
+    <script src="app.js?v=5"></script>
+</body>
+
+</html>

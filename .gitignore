@@ -1,0 +1,32 @@
+# PyInstaller & Build artifacts
+build/
+dist/
+*.exe
+*.pkg
+*.pyz
+*.toc
+warn-*.txt
+xref-*.html
+
+# Large Models & Binaries (Several GBs)
+models/
+ffmpeg-master-latest-win64-gpl/
+*.tar.*
+*.pth
+*.bin
+
+# Private Keys & Local User Settings
+settings.json
+queue.json
+project-*.json
+*.log
+
+# Python cache & temp
+__pycache__/
+*.pyc
+*.pyo
+.vscode/
+scratch/
+test_*.mp3
+dist_test.mp3
+edge_tts_fix.zip

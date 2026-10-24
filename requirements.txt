@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+pydub
+google-generativeai
+python-multipart
+demucs
+faster-whisper
+google-genai
+google-cloud-storage
+voxcpm
+soundfile
+edge-tts>=7.3.1
