@@ -1311,31 +1311,49 @@ async def check_updates_endpoint():
     except Exception as e:
         result["edge_tts"]["error"] = str(e)
 
-    # 2. Check GitHub Releases for core app updates
+    # 2. Check GitHub Releases or Tags for core app updates
     repo = settings.get("github_update_repo", "").strip()
     if repo:
         try:
-            import urllib.request, json
+            import urllib.request, urllib.error, json
             gh_url = f"https://api.github.com/repos/{repo}/releases/latest"
             req = urllib.request.Request(gh_url, headers={"User-Agent": "AutoDubber-Updater/2.1", "Accept": "application/vnd.github.v3+json"})
-            with urllib.request.urlopen(req, timeout=7) as resp:
-                gh_data = json.loads(resp.read().decode("utf-8"))
-                tag_name = gh_data.get("tag_name", "").lstrip("vV")
-                result["github"]["latest_version"] = tag_name
-                result["github"]["release_notes"] = gh_data.get("body", "")
-                
-                # Check assets for zip
-                assets = gh_data.get("assets", [])
-                for a in assets:
-                    if a.get("name", "").endswith(".zip"):
-                        result["github"]["download_url"] = a.get("browser_download_url")
-                        break
-                if not result["github"]["download_url"]:
-                    result["github"]["download_url"] = gh_data.get("zipball_url")
+            has_release = False
+            try:
+                with urllib.request.urlopen(req, timeout=7) as resp:
+                    gh_data = json.loads(resp.read().decode("utf-8"))
+                    tag_name = gh_data.get("tag_name", "").lstrip("vV")
+                    result["github"]["latest_version"] = tag_name
+                    result["github"]["release_notes"] = gh_data.get("body", "")
                     
-                if tag_name:
-                    from packaging import version as pkg_version
-                    result["github"]["has_update"] = pkg_version.parse(tag_name) > pkg_version.parse(APP_VERSION)
+                    # Check assets for zip
+                    assets = gh_data.get("assets", [])
+                    for a in assets:
+                        if a.get("name", "").endswith(".zip"):
+                            result["github"]["download_url"] = a.get("browser_download_url")
+                            break
+                    if not result["github"]["download_url"]:
+                        result["github"]["download_url"] = gh_data.get("zipball_url")
+                    has_release = True
+            except urllib.error.HTTPError as he:
+                if he.code == 404:
+                    # Fallback to /tags if formal release not yet created
+                    tags_url = f"https://api.github.com/repos/{repo}/tags"
+                    treq = urllib.request.Request(tags_url, headers={"User-Agent": "AutoDubber-Updater/2.1", "Accept": "application/vnd.github.v3+json"})
+                    with urllib.request.urlopen(treq, timeout=7) as tresp:
+                        tags_data = json.loads(tresp.read().decode("utf-8"))
+                        if tags_data:
+                            latest_tag = tags_data[0]
+                            tag_name = latest_tag.get("name", "").lstrip("vV")
+                            result["github"]["latest_version"] = tag_name
+                            result["github"]["download_url"] = latest_tag.get("zipball_url")
+                            has_release = True
+                else:
+                    raise he
+
+            if has_release and result["github"]["latest_version"]:
+                from packaging import version as pkg_version
+                result["github"]["has_update"] = pkg_version.parse(result["github"]["latest_version"]) > pkg_version.parse(APP_VERSION)
         except Exception as e:
             result["github"]["error"] = str(e)
             
