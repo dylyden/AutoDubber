@@ -89,13 +89,36 @@ def natural_sort_key(s):
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AutoDubberServer")
 
-main_loop = None
+_browser_opened = False
+
+def auto_open_browser():
+    global _browser_opened
+    if _browser_opened:
+        return
+    _browser_opened = True
+    time.sleep(1.2)
+    url = "http://127.0.0.1:8500"
+    try:
+        if hasattr(os, "startfile"):
+            os.startfile(url)
+            return
+    except Exception:
+        pass
+    try:
+        import webbrowser
+        webbrowser.open(url)
+        return
+    except Exception:
+        pass
+    try:
+        subprocess.Popen(["cmd", "/c", "start", url], shell=True)
+    except Exception:
+        pass
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global main_loop
     main_loop = asyncio.get_running_loop()
-
 
     # Ensure subtitles directory exists
     try:
@@ -104,19 +127,18 @@ async def lifespan(app: FastAPI):
     except Exception as init_err:
         logger.error(f"Failed to initialize subtitles dir: {init_err}")
 
+    # Launch browser automatically via native Windows ShellExecute
+    threading.Thread(target=auto_open_browser, daemon=True).start()
+
     send_log("DenZin Auto-Dubber Engine Initialized. Ready for actions.", "success")
     yield
 
-    # Cleanup on application exit/shutdown: only reset the queue.
-    # Segment audio previews are wiped on the NEXT startup (fresh start).
-    # This allows the user to close and reopen the tool without losing previews mid-session.
+    # Cleanup on application exit/shutdown: save the queue.
     try:
-        queue_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queue.json")
-        with open(queue_file, "w") as f:
-            json.dump([], f)
-        logger.info("Queue reset on shutdown.")
-    except Exception as shutdown_clean_err:
-        logger.error(f"Shutdown cleanup error: {shutdown_clean_err}")
+        save_queue_to_disk()
+        logger.info("Queue saved on shutdown.")
+    except Exception as shutdown_err:
+        logger.error(f"Shutdown save error: {shutdown_err}")
 
 app = FastAPI(title="DenZin Auto-Dubber Server", lifespan=lifespan)
 
@@ -458,63 +480,75 @@ async def clear_all():
 
 # File Explorer Browsing
 def run_file_dialog(browse_type: str):
-    import tkinter as tk
-    from tkinter import filedialog
-    
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes('-topmost', True)
-    
-    result = None
+    # Execute in an isolated subprocess to prevent Tkinter 'main thread is not in main loop' crash
+    py_code = (
+        "import sys, json, os\n"
+        "try:\n"
+        "    import tkinter as tk\n"
+        "    from tkinter import filedialog\n"
+        "    root = tk.Tk()\n"
+        "    root.withdraw()\n"
+        "    root.attributes('-topmost', True)\n"
+        "    root.focus_force()\n"
+        f"    b_type = {repr(browse_type)}\n"
+        "    res = None\n"
+        "    if b_type == 'files':\n"
+        "        f = filedialog.askopenfilenames(title='Select Video Files', filetypes=[('Video Files', '*.mp4 *.mkv *.avi *.mov *.flv *.ts *.webm *.3gp'), ('All Files', '*.*')])\n"
+        "        res = list(f) if f else None\n"
+        "    elif b_type in ['folder', 'output']:\n"
+        "        d = filedialog.askdirectory(title='Select Folder')\n"
+        "        res = d if d else None\n"
+        "    else:\n"
+        "        f = filedialog.askopenfilename(title='Select Audio Reference File', filetypes=[('Audio Files', '*.wav *.mp3 *.flac *.m4a *.ogg *.aac'), ('All Files', '*.*')])\n"
+        "        res = f if f else None\n"
+        "    try:\n"
+        "        root.destroy()\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    print('DIALOG_RESULT:' + json.dumps(res))\n"
+        "except Exception as e:\n"
+        "    print('DIALOG_ERROR:' + str(e))\n"
+    )
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", py_code],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+        for line in proc.stdout.splitlines():
+            if line.startswith("DIALOG_RESULT:"):
+                return json.loads(line[14:])
+            if line.startswith("DIALOG_ERROR:"):
+                logger.error(f"Dialog subprocess error: {line}")
+    except Exception as e:
+        logger.error(f"Subprocess file dialog failed: {e}")
+
+    # Fallback to PowerShell native WinForms dialog
     try:
         if browse_type == "files":
-            res = filedialog.askopenfilenames(
-                title="Select Video Files",
-                filetypes=[("Video Files", "*.mp4 *.mkv *.avi *.mov *.flv *.ts *.webm *.3gp")]
-            )
-            result = list(res) if res else None
-        elif browse_type == "folder":
-            res = filedialog.askdirectory(title="Select Folder containing Videos")
-            result = res if res else None
-        elif browse_type == "output":
-            res = filedialog.askdirectory(title="Select Output Folder")
-            result = res if res else None
-        elif browse_type == "male_voice":
-            res = filedialog.askopenfilename(
-                title="Select Male Reference Voice Audio",
-                filetypes=[("Audio Files", "*.wav *.mp3 *.flac *.m4a *.ogg *.aac")]
-            )
-            result = res if res else None
-        elif browse_type == "female_voice":
-            res = filedialog.askopenfilename(
-                title="Select Female Reference Voice Audio",
-                filetypes=[("Audio Files", "*.wav *.mp3 *.flac *.m4a *.ogg *.aac")]
-            )
-            result = res if res else None
-        elif browse_type == "narrator_male_voice":
-            res = filedialog.askopenfilename(
-                title="Select Narrator Male Reference Voice Audio",
-                filetypes=[("Audio Files", "*.wav *.mp3 *.flac *.m4a *.ogg *.aac")]
-            )
-            result = res if res else None
-        elif browse_type == "narrator_female_voice":
-            res = filedialog.askopenfilename(
-                title="Select Narrator Female Reference Voice Audio",
-                filetypes=[("Audio Files", "*.wav *.mp3 *.flac *.m4a *.ogg *.aac")]
-            )
-            result = res if res else None
-        elif browse_type in ["young_male_voice", "young_female_voice", "old_male_voice", "old_female_voice"]:
-            res = filedialog.askopenfilename(
-                title=f"Select {browse_type.replace('_', ' ').title()} Audio",
-                filetypes=[("Audio Files", "*.wav *.mp3 *.flac *.m4a *.ogg *.aac")]
-            )
-            result = res if res else None
-    except Exception as e:
-        logger.error(f"Failed to run file dialog: {e}")
-    finally:
-        root.destroy()
-        
-    return result
+            ps_script = "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Multiselect = $true; $d.Filter = 'Video Files|*.mp4;*.mkv;*.avi;*.mov;*.flv;*.ts;*.webm;*.3gp|All Files|*.*'; if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [System.String]::Join('||', $d.FileNames) }"
+        elif browse_type in ["folder", "output"]:
+            ps_script = "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; $d = New-Object System.Windows.Forms.FolderBrowserDialog; if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $d.SelectedPath }"
+        else:
+            ps_script = "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Filter = 'Audio Files|*.wav;*.mp3;*.flac;*.m4a;*.ogg;*.aac|All Files|*.*'; if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $d.FileName }"
+
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+        out = proc.stdout.strip()
+        if out:
+            if browse_type == "files":
+                return [p.strip() for p in out.split("||") if p.strip()]
+            return out
+    except Exception as ps_err:
+        logger.error(f"PowerShell file dialog fallback failed: {ps_err}")
+
+    return None
 
 @app.get("/api/browse")
 async def browse_path(type: str):
@@ -1562,15 +1596,21 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    # Auto-open browser after a short delay
-    def open_browser():
-        time.sleep(2)
-        try:
-            webbrowser.open("http://127.0.0.1:8500")
-        except Exception as e:
-            print(f"Failed to auto-open browser: {e}")
-            
-    threading.Thread(target=open_browser, daemon=True).start()
+    # Check if another AutoDubber instance is already running
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.connect(("127.0.0.1", 8500))
+        s.close()
+        print("[INFO] AutoDubber server is already running on port 8500. Opening UI in browser...")
+        auto_open_browser()
+        time.sleep(1)
+        sys.exit(0)
+    except Exception:
+        pass
+
+    # Auto-open browser after startup
+    threading.Thread(target=auto_open_browser, daemon=True).start()
 
     # Verify that ffmpeg is accessible
     setup_ffmpeg_path()
