@@ -172,7 +172,7 @@ default_settings = {
         "melody": True,
         "melody_vol": 100
     },
-    "github_update_repo": "",
+    "github_update_repo": "dylyden/AutoDubber",
     "auto_check_updates": True
 }
 
