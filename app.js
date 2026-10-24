@@ -427,7 +427,18 @@ function setupEventListeners() {
                 if (githubUpdateStatus) githubUpdateStatus.innerHTML = `<span style="color: #aaa;"><i class="fa-solid fa-info-circle"></i> ${data.github.error}</span>`;
             } else if (data.github?.repo) {
                 if (updateAppBadge) updateAppBadge.innerHTML = `<span class="badge badge-success" style="font-size: 11px;">Up to date</span>`;
-                if (githubUpdateStatus) githubUpdateStatus.innerHTML = `<span style="color: #9ccfd8;"><i class="fa-solid fa-check"></i> Core engine is up to date (v${data.current_app_version}).</span>`;
+                if (githubUpdateStatus) {
+                    githubUpdateStatus.innerHTML = `
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 6px;">
+                            <span style="color: #9ccfd8;"><i class="fa-solid fa-check"></i> Core engine is up to date (v${data.current_app_version}).</span>
+                            <button class="btn btn-sm btn-secondary" id="btn-reapply-patch" style="font-size: 12px; padding: 4px 10px; margin-left: 10px;">
+                                <i class="fa-solid fa-arrows-rotate"></i> Re-Sync Files
+                            </button>
+                        </div>
+                    `;
+                    const btnReapply = document.getElementById('btn-reapply-patch');
+                    if (btnReapply) btnReapply.addEventListener('click', () => applyGitHubPatch(data.github.download_url));
+                }
             } else {
                 if (githubUpdateStatus) githubUpdateStatus.innerHTML = `<span style="color: #888;">Enter your GitHub repository (e.g. username/repo) to check for app code updates.</span>`;
             }
