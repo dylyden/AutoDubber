@@ -3650,3 +3650,12 @@ class Dubber:
             ]
             await self.async_run_cmd(m4a_cmd, f"YouTube Audio Stem ({lang_code})")
             self.log(f"[SUCCESS] YouTube stem exported: YouTube_Audio_Tracks\\[Dubbed]_{clean_name}_{lang_code}.m4a", "success")
+
+# Sync runtime version into frozen __main__ (AutoDubber.exe) so hot-patches update the UI version badge
+try:
+    _main_mod = sys.modules.get("__main__")
+    if _main_mod is not None and hasattr(_main_mod, "APP_VERSION"):
+        _main_mod.APP_VERSION = "2.2.0"
+except Exception:
+    pass
+

@@ -23,7 +23,7 @@ def main():
     root_dir = os.path.dirname(os.path.abspath(__file__))
     server_py = os.path.join(root_dir, "server.py")
 
-    # 1. Bump APP_VERSION in server.py
+    # 1. Bump APP_VERSION in server.py and dubber.py
     if os.path.exists(server_py):
         with open(server_py, "r", encoding="utf-8") as f:
             content = f.read()
@@ -31,6 +31,15 @@ def main():
         with open(server_py, "w", encoding="utf-8") as f:
             f.write(updated_content)
         print(f"[OK] Bumped APP_VERSION to {new_version} in server.py")
+
+    dubber_py = os.path.join(root_dir, "dubber.py")
+    if os.path.exists(dubber_py):
+        with open(dubber_py, "r", encoding="utf-8") as f:
+            d_content = f.read()
+        d_updated = re.sub(r'_main_mod\.APP_VERSION\s*=\s*["\'].*?["\']', f'_main_mod.APP_VERSION = "{new_version}"', d_content)
+        with open(dubber_py, "w", encoding="utf-8") as f:
+            f.write(d_updated)
+        print(f"[OK] Bumped _main_mod.APP_VERSION to {new_version} in dubber.py")
 
     # 2. Build lightweight patch.zip
     patch_zip_name = "patch.zip"

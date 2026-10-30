@@ -397,7 +397,15 @@ function setupEventListeners() {
             const res = await fetch('/api/system/check-updates');
             const data = await res.json();
 
-            if (updateAppVerDisplay) updateAppVerDisplay.textContent = `v${data.current_app_version || '2.1.0'}`;
+            const activeVer = data.github?.latest_version && localStorage.getItem('autodubber_patched_version') === data.github.latest_version
+                ? data.github.latest_version
+                : (data.current_app_version || '2.2.0');
+            if (data.github?.latest_version && activeVer === data.github.latest_version) {
+                data.github.has_update = false;
+                data.current_app_version = activeVer;
+            }
+
+            if (updateAppVerDisplay) updateAppVerDisplay.textContent = `v${data.current_app_version || '2.2.0'}`;
             if (updateEdgeVerDisplay) updateEdgeVerDisplay.textContent = `v${data.current_edge_tts || 'unknown'}`;
             if (inputGithubRepo && data.github?.repo) inputGithubRepo.value = data.github.repo;
 
@@ -507,6 +515,16 @@ function setupEventListeners() {
             });
             const d = await res.json();
             if (res.ok) {
+                if (d.new_version) {
+                    localStorage.setItem('autodubber_patched_version', d.new_version);
+                } else {
+                    try {
+                        const chk = await fetch('/api/system/check-updates').then(r => r.json());
+                        if (chk.github?.latest_version) {
+                            localStorage.setItem('autodubber_patched_version', chk.github.latest_version);
+                        }
+                    } catch (_) {}
+                }
                 logUpdate(`SUCCESS: Extracted ${d.extracted_files} updated files. Refreshing UI in 2 seconds...`);
                 setTimeout(() => window.location.reload(), 2000);
             } else {
