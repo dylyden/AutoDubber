@@ -509,10 +509,7 @@ global_voxcpm_4gb_model = None
 global_openvoice_converter = None
 
 def get_voxcpm_lock():
-    global voxcpm_gpu_lock
-    if voxcpm_gpu_lock is None:
-        voxcpm_gpu_lock = asyncio.Semaphore(1)
-    return voxcpm_gpu_lock
+    return get_whisper_lock()
 
 def get_local_openvoice_converter(device: str = "auto"):
     global global_openvoice_converter
@@ -3958,7 +3955,7 @@ class Dubber:
 try:
     _main_mod = sys.modules.get("__main__")
     if _main_mod is not None and hasattr(_main_mod, "APP_VERSION"):
-        _main_mod.APP_VERSION = "2.2.4"
+        _main_mod.APP_VERSION = "2.2.5"
 except Exception:
     pass
 

@@ -1,5 +1,6 @@
 import os
 import json
+import threading
 from typing import Tuple
 import torch
 import torch.nn as nn
@@ -721,11 +722,19 @@ class VoxCPM4GBEngine:
                 mod.norm.to("cuda", dtype=torch.float16)
                 if hasattr(mod, "rope_emb") and mod.rope_emb is not None:
                     mod.rope_emb = MiniCPMLongRoPE(mod.config).to("cuda")
+                    mod.rope_emb.cos_cached = mod.rope_emb.cos_cached.to("cuda")
+                    mod.rope_emb.sin_cached = mod.rope_emb.sin_cached.to("cuda")
             else:
                 for sub in mod.modules():
                     if hasattr(sub, "rope_emb") and sub.rope_emb is not None:
-                        sub.rope_emb = MiniCPMLongRoPE(sub.config)
+                        sub.rope_emb = MiniCPMLongRoPE(sub.config).to("cuda")
+                        sub.rope_emb.cos_cached = sub.rope_emb.cos_cached.to("cuda")
+                        sub.rope_emb.sin_cached = sub.rope_emb.sin_cached.to("cuda")
                 mod.to("cuda")
+                for sub in mod.modules():
+                    if hasattr(sub, "rope_emb") and sub.rope_emb is not None:
+                        sub.rope_emb.cos_cached = sub.rope_emb.cos_cached.to("cuda")
+                        sub.rope_emb.sin_cached = sub.rope_emb.sin_cached.to("cuda")
 
         for p_name, p in model.named_parameters():
             if "audio_vae" in p_name:
@@ -774,52 +783,79 @@ class VoxCPM4GBEngine:
         wrapper.denoiser = None
         self._vox = wrapper
         self._on_gpu = True
+        self._gpu_mutex = threading.RLock()
 
     def offload_to_ram(self):
         """Parks CUDA layers in System RAM in ~0.8s without touching disk or freeing the object."""
-        if getattr(self, "run_device", "cpu") != "cuda" or not getattr(self, "_on_gpu", False):
-            return
-        model = self._vox.tts_model
-        for name, mod in model.named_children():
-            if name == "audio_vae":
-                if getattr(self, "_vram_tier_gb", 4.0) >= 5.5:
+        with self._gpu_mutex:
+            if getattr(self, "run_device", "cpu") != "cuda" or not getattr(self, "_on_gpu", False):
+                return
+            model = self._vox.tts_model
+            for name, mod in model.named_children():
+                if name == "audio_vae":
+                    if getattr(self, "_vram_tier_gb", 4.0) >= 5.5:
+                        mod.to("cpu")
+                    continue
+                elif name in ("base_lm", "residual_lm"):
+                    mod.layers.to("cpu")
+                    mod.norm.to("cpu")
+                    if hasattr(mod, "rope_emb") and mod.rope_emb is not None:
+                        mod.rope_emb.to("cpu")
+                        mod.rope_emb.cos_cached = mod.rope_emb.cos_cached.to("cpu")
+                        mod.rope_emb.sin_cached = mod.rope_emb.sin_cached.to("cpu")
+                    if hasattr(mod, "kv_cache") and mod.kv_cache is not None and hasattr(mod.kv_cache, "kv_cache"):
+                        mod.kv_cache.kv_cache = mod.kv_cache.kv_cache.to("cpu")
+                else:
                     mod.to("cpu")
-                continue
-            elif name in ("base_lm", "residual_lm"):
-                mod.layers.to("cpu")
-                mod.norm.to("cpu")
-                if hasattr(mod, "rope_emb") and mod.rope_emb is not None:
-                    mod.rope_emb.to("cpu")
-                if hasattr(mod, "kv_cache") and mod.kv_cache is not None:
-                    mod.kv_cache.to("cpu")
-            else:
-                mod.to("cpu")
-        self._on_gpu = False
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+                    for sub in mod.modules():
+                        if hasattr(sub, "rope_emb") and sub.rope_emb is not None:
+                            sub.rope_emb.cos_cached = sub.rope_emb.cos_cached.to("cpu")
+                            sub.rope_emb.sin_cached = sub.rope_emb.sin_cached.to("cpu")
+            self._on_gpu = False
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def reload_to_gpu(self):
         """Restores parked System RAM layers back to CUDA in ~0.7s without reading disk."""
-        if getattr(self, "run_device", "cpu") != "cuda" or getattr(self, "_on_gpu", False):
-            return
-        model = self._vox.tts_model
-        for name, mod in model.named_children():
-            if name == "audio_vae":
-                if getattr(self, "_vram_tier_gb", 4.0) >= 5.5:
-                    mod.to("cuda", dtype=torch.float32)
-                continue
-            elif name in ("base_lm", "residual_lm"):
-                mod.layers.to("cuda")
-                mod.norm.to("cuda", dtype=torch.float16)
-                if hasattr(mod, "rope_emb") and mod.rope_emb is not None:
-                    mod.rope_emb.to("cuda")
-                if hasattr(mod, "kv_cache") and mod.kv_cache is not None:
-                    mod.kv_cache.to("cuda")
-            else:
-                mod.to("cuda")
-        self._on_gpu = True
+        with self._gpu_mutex:
+            if getattr(self, "run_device", "cpu") != "cuda":
+                return
+            model = self._vox.tts_model
+            if not getattr(self, "_on_gpu", False):
+                for name, mod in model.named_children():
+                    if name == "audio_vae":
+                        if getattr(self, "_vram_tier_gb", 4.0) >= 5.5:
+                            mod.to("cuda", dtype=torch.float32)
+                        continue
+                    elif name in ("base_lm", "residual_lm"):
+                        mod.layers.to("cuda")
+                        mod.norm.to("cuda", dtype=torch.float16)
+                        if hasattr(mod, "rope_emb") and mod.rope_emb is not None:
+                            mod.rope_emb.to("cuda")
+                            mod.rope_emb.cos_cached = mod.rope_emb.cos_cached.to("cuda")
+                            mod.rope_emb.sin_cached = mod.rope_emb.sin_cached.to("cuda")
+                        if hasattr(mod, "kv_cache") and mod.kv_cache is not None and hasattr(mod.kv_cache, "kv_cache"):
+                            mod.kv_cache.kv_cache = mod.kv_cache.kv_cache.to("cuda", dtype=torch.float16)
+                    else:
+                        mod.to("cuda")
+                        for sub in mod.modules():
+                            if hasattr(sub, "rope_emb") and sub.rope_emb is not None:
+                                sub.rope_emb.cos_cached = sub.rope_emb.cos_cached.to("cuda")
+                                sub.rope_emb.sin_cached = sub.rope_emb.sin_cached.to("cuda")
+                self._on_gpu = True
+
+            # Ensure all MiniCPMLongRoPE cos_cached/sin_cached and StaticKVCache tensors are on CUDA
+            for sub in model.modules():
+                if hasattr(sub, "cos_cached") and isinstance(sub.cos_cached, torch.Tensor) and not sub.cos_cached.is_cuda:
+                    sub.cos_cached = sub.cos_cached.to("cuda")
+                if hasattr(sub, "sin_cached") and isinstance(sub.sin_cached, torch.Tensor) and not sub.sin_cached.is_cuda:
+                    sub.sin_cached = sub.sin_cached.to("cuda")
+                if hasattr(sub, "kv_cache") and sub.kv_cache is not None and hasattr(sub.kv_cache, "kv_cache"):
+                    if not sub.kv_cache.kv_cache.is_cuda:
+                        sub.kv_cache.kv_cache = sub.kv_cache.kv_cache.to("cuda", dtype=torch.float16)
 
     def generate(self, **kwargs):
-        self.reload_to_gpu()
-        return self._vox.generate(**kwargs)
+        with self._gpu_mutex:
+            self.reload_to_gpu()
+            return self._vox.generate(**kwargs)
 
