@@ -1333,8 +1333,35 @@ async def re_dub_video_endpoint(video_id: str):
 # --- Universal Dual-Channel Auto-Updater Endpoints ---
 APP_VERSION = "2.2.0"
 
+def get_runtime_app_version() -> str:
+    """Reads active version from disk (server.py or version.txt) so hot-patches update immediately without exe rebuild."""
+    global APP_VERSION
+    app_root = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+    ver_file = os.path.join(app_root, "version.txt")
+    if os.path.exists(ver_file):
+        try:
+            with open(ver_file, "r", encoding="utf-8") as vf:
+                v = vf.read().strip().lstrip("vV")
+                if v:
+                    APP_VERSION = v
+                    return APP_VERSION
+        except Exception:
+            pass
+    disk_server = os.path.join(app_root, "server.py")
+    if os.path.exists(disk_server):
+        try:
+            with open(disk_server, "r", encoding="utf-8") as sf:
+                m = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', sf.read())
+                if m:
+                    APP_VERSION = m.group(1).lstrip("vV")
+                    return APP_VERSION
+        except Exception:
+            pass
+    return APP_VERSION
+
 @app.get("/api/system/version")
 async def get_system_version():
+    active_ver = get_runtime_app_version()
     edge_ver = "unknown"
     try:
         import edge_tts
@@ -1342,7 +1369,7 @@ async def get_system_version():
     except Exception:
         pass
     return {
-        "app_version": APP_VERSION,
+        "app_version": active_ver,
         "edge_tts_version": edge_ver,
         "python_version": sys.version.split()[0],
         "is_frozen": getattr(sys, 'frozen', False)
@@ -1350,8 +1377,9 @@ async def get_system_version():
 
 @app.get("/api/system/check-updates")
 async def check_updates_endpoint():
+    active_ver = get_runtime_app_version()
     result = {
-        "current_app_version": APP_VERSION,
+        "current_app_version": active_ver,
         "current_edge_tts": "unknown",
         "edge_tts": {
             "has_update": False,
@@ -1444,7 +1472,7 @@ async def check_updates_endpoint():
 
             if has_release and result["github"]["latest_version"]:
                 from packaging import version as pkg_version
-                result["github"]["has_update"] = pkg_version.parse(result["github"]["latest_version"]) > pkg_version.parse(APP_VERSION)
+                result["github"]["has_update"] = pkg_version.parse(result["github"]["latest_version"]) > pkg_version.parse(active_ver)
         except Exception as e:
             result["github"]["error"] = str(e)
             
@@ -1562,9 +1590,25 @@ async def apply_github_update_endpoint(req: ApplyUpdateRequest):
                     with zf.open(member) as src, open(target_file, "wb") as dst:
                         shutil.copyfileobj(src, dst)
                     extracted_count += 1
+
+        # Hot-reload dubber module and version in-memory so no restart is required
+        new_ver = get_runtime_app_version()
+        try:
+            import importlib
+            if "dubber" in sys.modules:
+                import dubber as dubber_mod
+                importlib.reload(dubber_mod)
+                global Dubber, identify_key_format, get_keys_breakdown, api_key_pool
+                Dubber = dubber_mod.Dubber
+                identify_key_format = dubber_mod.identify_key_format
+                get_keys_breakdown = dubber_mod.get_keys_breakdown
+                api_key_pool = dubber_mod.api_key_pool
+                api_key_pool.set_keys(api_keys)
+        except Exception as reload_err:
+            logger.warning(f"Hot-reload of dubber encountered: {reload_err}")
                     
-        send_log(f"Applied patch with {extracted_count} updated components! Please refresh or restart.", "success")
-        return {"status": "success", "extracted_files": extracted_count}
+        send_log(f"Applied patch v{new_ver} ({extracted_count} components hot-reloaded in memory)!", "success")
+        return {"status": "success", "extracted_files": extracted_count, "new_version": new_ver}
     except Exception as e:
         logger.exception("Failed to apply GitHub patch")
         send_log(f"GitHub patch failed: {e}", "error")
@@ -1584,11 +1628,16 @@ if __name__ == "__main__":
     import tkinter as tk
     from tkinter import messagebox
 
-
-
     # Set working directory to executable directory for full portability
     if getattr(sys, 'frozen', False):
         exe_dir = os.path.dirname(sys.executable)
+        external_server = os.path.join(exe_dir, "server.py")
+        if os.path.exists(external_server) and os.environ.get("AUTODUBBER_EXTERNAL_BOOT") != "1":
+            os.environ["AUTODUBBER_EXTERNAL_BOOT"] = "1"
+            with open(external_server, "r", encoding="utf-8") as _esf:
+                _code = compile(_esf.read(), external_server, "exec")
+            exec(_code, {"__name__": "__main__", "__file__": external_server})
+            sys.exit(0)
     else:
         exe_dir = os.path.dirname(os.path.abspath(__file__))
     try:
