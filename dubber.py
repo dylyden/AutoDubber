@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 import subprocess
 import uuid
@@ -552,17 +552,17 @@ def get_local_voxcpm_4gb_model(device: str = "auto"):
         ]
         local_path = None
         for p in project_models:
-            if os.path.isdir(p) and os.path.exists(os.path.join(p, "model.safetensors")):
+            if os.path.isdir(p) and (os.path.exists(os.path.join(p, "model_int8_4gb.safetensors")) or os.path.exists(os.path.join(p, "model.safetensors"))):
                 local_path = p
                 break
         if not local_path:
             hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface/hub"))
             snapshots = glob.glob(os.path.join(hf_home, "models--openbmb--VoxCPM2", "snapshots", "*"))
             for snap in snapshots:
-                if os.path.isdir(snap) and os.path.exists(os.path.join(snap, "model.safetensors")):
+                if os.path.isdir(snap) and (os.path.exists(os.path.join(snap, "model_int8_4gb.safetensors")) or os.path.exists(os.path.join(snap, "model.safetensors"))):
                     local_path = snap
                     break
-        model_path = local_path if local_path else os.path.join(base_dir, "models", "VoxCPM2")
+        exe_root = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else base_dir; model_path = local_path if local_path else os.path.join(exe_root, "models", "VoxCPM2")
         run_device = "cuda" if (torch.cuda.is_available() and device != "cpu") else "cpu"
         global_voxcpm_4gb_model = VoxCPM4GBEngine(model_dir=model_path, device=run_device)
     else:
@@ -584,7 +584,7 @@ def get_local_voxcpm_model(device: str = "auto"):
         ]
         local_path = None
         for p in project_models:
-            if os.path.isdir(p) and os.path.exists(os.path.join(p, "model.safetensors")):
+            if os.path.isdir(p) and (os.path.exists(os.path.join(p, "model_int8_4gb.safetensors")) or os.path.exists(os.path.join(p, "model.safetensors"))):
                 local_path = p
                 break
 
@@ -593,7 +593,7 @@ def get_local_voxcpm_model(device: str = "auto"):
             hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface/hub"))
             snapshots = glob.glob(os.path.join(hf_home, "models--openbmb--VoxCPM2", "snapshots", "*"))
             for snap in snapshots:
-                if os.path.isdir(snap) and os.path.exists(os.path.join(snap, "model.safetensors")):
+                if os.path.isdir(snap) and (os.path.exists(os.path.join(snap, "model_int8_4gb.safetensors")) or os.path.exists(os.path.join(snap, "model.safetensors"))):
                     local_path = snap
                     break
 
@@ -3958,7 +3958,7 @@ class Dubber:
 try:
     _main_mod = sys.modules.get("__main__")
     if _main_mod is not None and hasattr(_main_mod, "APP_VERSION"):
-        _main_mod.APP_VERSION = "2.2.1"
+        _main_mod.APP_VERSION = "2.2.3"
 except Exception:
     pass
 

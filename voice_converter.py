@@ -505,11 +505,37 @@ def build_or_get_int8_safetensors(model_dir: str) -> str:
     from safetensors import safe_open
     from safetensors.torch import save_file
 
+    os.makedirs(model_dir, exist_ok=True)
     int8_path = os.path.join(model_dir, "model_int8_4gb.safetensors")
     if os.path.exists(int8_path) and os.path.getsize(int8_path) > 100_000_000:
         return int8_path
 
     src_path = os.path.join(model_dir, "model.safetensors")
+    required_files = [
+        "config.json",
+        "audiovae.pth",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+    ]
+    missing_meta = [f for f in required_files if not os.path.exists(os.path.join(model_dir, f))]
+    need_weights = not (os.path.exists(src_path) and os.path.getsize(src_path) > 1_000_000_000)
+
+    if missing_meta or need_weights:
+        from huggingface_hub import hf_hub_download, snapshot_download
+        for fname in missing_meta:
+            try:
+                hf_hub_download(repo_id="openbmb/VoxCPM2", filename=fname, local_dir=model_dir)
+            except Exception:
+                pass
+        if need_weights:
+            print(f"[VoxCPM2-4GB] Downloading openbmb/VoxCPM2 weights to {model_dir} (first-time setup)...")
+            try:
+                hf_hub_download(repo_id="openbmb/VoxCPM2", filename="model.safetensors", local_dir=model_dir)
+            except Exception:
+                snapshot_download(repo_id="openbmb/VoxCPM2", local_dir=model_dir)
+
+    print(f"[VoxCPM2-4GB] Quantizing model.safetensors -> model_int8_4gb.safetensors...")
     out_tensors = {}
     q_device = "cuda" if torch.cuda.is_available() else "cpu"
     with safe_open(src_path, framework="pt", device="cpu") as f:
@@ -547,6 +573,13 @@ def build_or_get_int8_safetensors(model_dir: str) -> str:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     save_file(out_tensors, int8_path)
+    # Remove the 4.02 GB raw FP32 model.safetensors after INT8 quantization to save client disk space
+    try:
+        if os.path.exists(int8_path) and os.path.getsize(int8_path) > 100_000_000 and os.path.exists(src_path):
+            os.remove(src_path)
+            print(f"[VoxCPM2-4GB] Reclaimed 4.02 GB disk space (removed raw model.safetensors).")
+    except Exception:
+        pass
     return int8_path
 
 
@@ -597,6 +630,13 @@ class VoxCPM4GBEngine:
             return
 
         int8_path = build_or_get_int8_safetensors(model_dir)
+        for req_meta in ("config.json", "audiovae.pth", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"):
+            if not os.path.exists(os.path.join(model_dir, req_meta)):
+                try:
+                    from huggingface_hub import hf_hub_download
+                    hf_hub_download(repo_id="openbmb/VoxCPM2", filename=req_meta, local_dir=model_dir)
+                except Exception:
+                    pass
         with open(os.path.join(model_dir, "config.json"), "r", encoding="utf-8") as f:
             config = VoxCPMConfig.model_validate_json(f.read())
 

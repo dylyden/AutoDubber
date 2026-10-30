@@ -1331,7 +1331,7 @@ async def re_dub_video_endpoint(video_id: str):
     return {"status": "success"}
 
 # --- Universal Dual-Channel Auto-Updater Endpoints ---
-APP_VERSION = "2.2.1"
+APP_VERSION = "2.2.3"
 
 def get_runtime_app_version() -> str:
     """Reads active version from disk (server.py or version.txt) so hot-patches update immediately without exe rebuild."""
