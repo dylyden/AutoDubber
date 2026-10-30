@@ -1331,7 +1331,7 @@ async def re_dub_video_endpoint(video_id: str):
     return {"status": "success"}
 
 # --- Universal Dual-Channel Auto-Updater Endpoints ---
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
 
 def get_runtime_app_version() -> str:
     """Reads active version from disk (server.py or version.txt) so hot-patches update immediately without exe rebuild."""
@@ -1577,7 +1577,7 @@ async def apply_github_update_endpoint(req: ApplyUpdateRequest):
         
         # Safe extraction: only extract allowed runtime files
         allowed_extensions = (".py", ".js", ".html", ".css", ".json")
-        allowed_files = ("dubber.py", "server.py", "app.js", "style.css", "index.html")
+        allowed_files = ("dubber.py", "voice_converter.py", "server.py", "app.js", "style.css", "index.html")
         
         extracted_count = 0
         with zipfile.ZipFile(io.BytesIO(patch_bytes)) as zf:
@@ -1595,6 +1595,9 @@ async def apply_github_update_endpoint(req: ApplyUpdateRequest):
         new_ver = get_runtime_app_version()
         try:
             import importlib
+            if 'voice_converter' in sys.modules:
+                import voice_converter as vc_mod
+                importlib.reload(vc_mod)
             if "dubber" in sys.modules:
                 import dubber as dubber_mod
                 importlib.reload(dubber_mod)

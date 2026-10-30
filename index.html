@@ -252,7 +252,7 @@
 
                         <!-- YouTube Multi-Audio Tracks Option -->
                         <div class="select-field full-width-field" id="youtube-multi-audio-container" style="grid-column: 1 / -1; background: rgba(255, 0, 0, 0.04); border: 1px solid rgba(255, 60, 60, 0.25); border-radius: 10px; padding: 14px 18px; margin-top: 6px; margin-bottom: 6px;">
-                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                            <div style="display: flex; justify-content: space-between; align-items: center;">
                                 <label class="checkbox-label" style="font-weight: 600; font-size: 15px; color: #ff6b6b; margin: 0; cursor: pointer; display: flex; align-items: center; gap: 8px;">
                                     <input type="checkbox" id="chk-youtube-multi-audio">
                                     <span class="checkbox-custom"></span>
@@ -260,10 +260,7 @@
                                 </label>
                                 <span class="badge" style="background: rgba(255, 0, 0, 0.15); color: #ff9999; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 6px; border: 1px solid rgba(255, 0, 0, 0.3);">OPTIONAL</span>
                             </div>
-                            <div style="font-size: 13px; color: #999; margin-bottom: 12px; line-height: 1.4;">
-                                បង្កើត Video ដើមតែ 1 (ភាសា Primary) និងផលិត File សំឡេង <strong>.m4a</strong> ពេញលេញ (BGM + Translated Speech) តាមភាសាដែលបានជ្រើសរើស សម្រាប់ Upload ចូល YouTube Studio Audio Track ដោយមិនបាច់ Render Video ឡើងវិញឡើយ។
-                            </div>
-                            <div id="youtube-languages-panel" style="display: none; padding-top: 10px; border-top: 1px dashed rgba(255, 255, 255, 0.12);">
+                            <div id="youtube-languages-panel" style="display: none; padding-top: 10px; margin-top: 10px; border-top: 1px dashed rgba(255, 255, 255, 0.12);">
                                 <label style="font-size: 13px; color: #ddd; font-weight: 500; display: block; margin-bottom: 6px;">
                                     ជ្រើសរើសភាសាបន្ថែម (Select Extra Languages):
                                 </label>
@@ -444,10 +441,17 @@
                                     </span>
                                 </label>
                                 <label class="radio-label" style="display: flex; align-items: flex-start; gap: 12px; font-size: 15px; cursor: pointer; line-height: 1.4;">
-                                    <input type="radio" name="tts-engine-radio" value="voxcpm2" style="display: none;">
+                                    <input type="radio" name="tts-engine-radio" value="voxcpm2-4gb" style="display: none;">
                                     <span class="radio-custom" style="flex-shrink: 0; margin-top: 3px;"></span>
                                     <span style="display: block;">
-                                        <strong>សម្លេងមនុស្សពិត</strong> (VoxCPM)
+                                        <strong>សម្លេងមនុស្សពិត VoxCPM 4GB Low-VRAM</strong>
+                                    </span>
+                                </label>
+                                <label class="radio-label" style="display: flex; align-items: flex-start; gap: 12px; font-size: 15px; cursor: pointer; line-height: 1.4;">
+                                    <input type="radio" name="tts-engine-radio" value="edge-openvoice" style="display: none;">
+                                    <span class="radio-custom" style="flex-shrink: 0; margin-top: 3px;"></span>
+                                    <span style="display: block;">
+                                        <strong>សម្លេង Clone ល្បឿនលឿនសម្រាប់ GPU តូច</strong>
                                     </span>
                                 </label>
                             </div>

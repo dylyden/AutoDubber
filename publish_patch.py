@@ -11,17 +11,43 @@ import zipfile
 import subprocess
 import re
 
+def _get_current_and_next_version(server_py_path: str):
+    curr_ver = "2.2.0"
+    if os.path.exists(server_py_path):
+        try:
+            with open(server_py_path, "r", encoding="utf-8") as f:
+                m = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', f.read())
+                if m:
+                    curr_ver = m.group(1).lstrip("vV")
+        except Exception:
+            pass
+    parts = [int(x) if x.isdigit() else 0 for x in curr_ver.split(".")]
+    while len(parts) < 3:
+        parts.append(0)
+    parts[-1] += 1
+    return curr_ver, ".".join(str(x) for x in parts)
+
+
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python publish_patch.py <version> [release_notes]")
-        print("Example: python publish_patch.py 2.1.1 \"Fixed audio sync issue\"")
-        sys.exit(1)
-
-    new_version = sys.argv[1].lstrip("vV")
-    notes = sys.argv[2] if len(sys.argv) >= 3 else f"Release v{new_version}"
-
     root_dir = os.path.dirname(os.path.abspath(__file__))
     server_py = os.path.join(root_dir, "server.py")
+    curr_ver, suggested_ver = _get_current_and_next_version(server_py)
+
+    if len(sys.argv) < 2:
+        print(f"Current Version : v{curr_ver}")
+        print(f"Suggested Next  : v{suggested_ver}\n")
+        try:
+            u_ver = input(f"Enter new version [Press ENTER for {suggested_ver}]: ").strip().lstrip("vV")
+            new_version = u_ver if u_ver else suggested_ver
+            u_notes = input("Enter release notes [Press ENTER for default]: ").strip()
+            notes = u_notes if u_notes else f"Release v{new_version}: Speed & Voice Engine Update"
+        except EOFError:
+            new_version = suggested_ver
+            notes = f"Release v{new_version}: Speed & Voice Engine Update"
+        print(f"\n[AUTO] Publishing v{new_version}...")
+    else:
+        new_version = sys.argv[1].lstrip("vV")
+        notes = sys.argv[2] if len(sys.argv) >= 3 else f"Release v{new_version}"
 
     # 1. Bump APP_VERSION in server.py and dubber.py
     if os.path.exists(server_py):
@@ -44,7 +70,7 @@ def main():
     # 2. Build lightweight patch.zip
     patch_zip_name = "patch.zip"
     patch_zip_path = os.path.join(root_dir, patch_zip_name)
-    files_to_pack = ["dubber.py", "server.py", "app.js", "index.html", "style.css"]
+    files_to_pack = ["dubber.py", "voice_converter.py", "server.py", "app.js", "index.html", "style.css"]
     
     with zipfile.ZipFile(patch_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for fname in files_to_pack:

@@ -1157,7 +1157,8 @@ async function loadSettings() {
             selectTargetLang.value = s.target_lang;
             selectGender.value = s.voice_gender;
             if (s.tts_engine) {
-                const ttsRadio = document.querySelector(`input[name="tts-engine-radio"][value="${s.tts_engine}"]`);
+                const mappedEngine = s.tts_engine === 'voxcpm2' ? 'voxcpm2-4gb' : s.tts_engine;
+                const ttsRadio = document.querySelector(`input[name="tts-engine-radio"][value="${mappedEngine}"]`);
                 if (ttsRadio) ttsRadio.checked = true;
             }
             if (inputHfSpace && s.hf_voxcpm_space) {
@@ -1218,7 +1219,8 @@ async function loadSettings() {
             if (hfSpaceContainer) {
                 const ttsRadios = document.querySelectorAll('input[name="tts-engine-radio"]');
                 const updateVoxFields = () => {
-                    const isVox = document.querySelector('input[name="tts-engine-radio"]:checked')?.value === 'voxcpm2';
+                    const selectedTts = document.querySelector('input[name="tts-engine-radio"]:checked')?.value;
+                    const isVox = selectedTts === 'voxcpm2' || selectedTts === 'voxcpm2-4gb';
                     hfSpaceContainer.style.display = isVox ? 'flex' : 'none';
                     if (hfTokenContainer) hfTokenContainer.style.display = isVox ? 'flex' : 'none';
                 };

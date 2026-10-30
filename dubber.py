@@ -505,12 +505,69 @@ def get_gemini_lock():
 
 voxcpm_gpu_lock = None
 global_voxcpm_model = None
+global_voxcpm_4gb_model = None
+global_openvoice_converter = None
 
 def get_voxcpm_lock():
     global voxcpm_gpu_lock
     if voxcpm_gpu_lock is None:
         voxcpm_gpu_lock = asyncio.Semaphore(1)
     return voxcpm_gpu_lock
+
+def get_local_openvoice_converter(device: str = "auto"):
+    global global_openvoice_converter
+    if global_openvoice_converter is None:
+        from voice_converter import ToneColorConverterEngine
+        base_dir = get_base_path()
+        model_dir = os.path.join(base_dir, "models", "OpenVoiceV2")
+        if getattr(sys, "frozen", False):
+            exe_model_dir = os.path.join(os.path.dirname(sys.executable), "models", "OpenVoiceV2")
+            if os.path.exists(exe_model_dir):
+                model_dir = exe_model_dir
+        run_device = "cuda" if (torch.cuda.is_available() and device != "cpu") else "cpu"
+        global_openvoice_converter = ToneColorConverterEngine(model_dir=model_dir, device=run_device)
+    return global_openvoice_converter
+
+def get_local_voxcpm_4gb_model(device: str = "auto"):
+    global global_voxcpm_4gb_model, global_whisper_model
+    # Park Faster-Whisper into System RAM (0.7s PCIe copy, zero disk reload) before VoxCPM 4GB runs
+    if global_whisper_model is not None:
+        try:
+            if hasattr(global_whisper_model, "model") and hasattr(global_whisper_model.model, "unload_model"):
+                global_whisper_model.model.unload_model(to_cpu=True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    if global_voxcpm_4gb_model is None:
+        import os, glob
+        import torch  # type: ignore
+        from voice_converter import VoxCPM4GBEngine
+
+        base_dir = get_base_path()
+        project_models = [
+            os.path.join(base_dir, "models", "VoxCPM2"),
+            os.path.join(os.path.dirname(sys.executable), "models", "VoxCPM2"),
+        ]
+        local_path = None
+        for p in project_models:
+            if os.path.isdir(p) and os.path.exists(os.path.join(p, "model.safetensors")):
+                local_path = p
+                break
+        if not local_path:
+            hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface/hub"))
+            snapshots = glob.glob(os.path.join(hf_home, "models--openbmb--VoxCPM2", "snapshots", "*"))
+            for snap in snapshots:
+                if os.path.isdir(snap) and os.path.exists(os.path.join(snap, "model.safetensors")):
+                    local_path = snap
+                    break
+        model_path = local_path if local_path else os.path.join(base_dir, "models", "VoxCPM2")
+        run_device = "cuda" if (torch.cuda.is_available() and device != "cpu") else "cpu"
+        global_voxcpm_4gb_model = VoxCPM4GBEngine(model_dir=model_path, device=run_device)
+    else:
+        global_voxcpm_4gb_model.reload_to_gpu()
+    return global_voxcpm_4gb_model
 
 def get_local_voxcpm_model(device: str = "auto"):
     global global_voxcpm_model
@@ -562,6 +619,89 @@ def get_local_voxcpm_model(device: str = "auto"):
             else:
                 raise e
     return global_voxcpm_model
+
+
+def fast_overlay_segments(base_duration_ms, placements, frame_rate=44100, channels=2):
+    """Overlays multiple (pos_ms, AudioSegment) pairs into a single timeline using one pre-allocated NumPy buffer."""
+    import numpy as np
+    total_frames = max(1, int(round(base_duration_ms * frame_rate / 1000.0)))
+    acc = np.zeros((total_frames, channels), dtype=np.int32)
+    for pos_ms, seg in placements:
+        if seg is None or len(seg) == 0:
+            continue
+        s = seg
+        if s.frame_rate != frame_rate:
+            s = s.set_frame_rate(frame_rate)
+        if s.channels != channels:
+            s = s.set_channels(channels)
+        if s.sample_width != 2:
+            s = s.set_sample_width(2)
+        arr = np.frombuffer(s.raw_data, dtype=np.int16)
+        n_frames = len(arr) // channels
+        if n_frames <= 0:
+            continue
+        arr = arr[:n_frames * channels].reshape((n_frames, channels))
+        start_idx = max(0, int(round(pos_ms * frame_rate / 1000.0)))
+        if start_idx >= total_frames:
+            continue
+        end_idx = min(total_frames, start_idx + n_frames)
+        acc[start_idx:end_idx] += arr[:end_idx - start_idx]
+    np.clip(acc, -32768, 32767, out=acc)
+    out_bytes = acc.astype(np.int16).tobytes()
+    return AudioSegment(
+        data=out_bytes,
+        sample_width=2,
+        frame_rate=frame_rate,
+        channels=channels,
+    )
+
+
+def fast_duck_audio_segment(bg_seg, merged_intervals, duck_db):
+    """Applies dynamic volume ducking with smooth linear crossfade ramps in-place on a single NumPy array."""
+    import numpy as np
+    if not merged_intervals or bg_seg is None or len(bg_seg) == 0:
+        return bg_seg
+    s = bg_seg
+    if s.sample_width != 2:
+        s = s.set_sample_width(2)
+    frame_rate = s.frame_rate
+    channels = s.channels
+    arr = np.frombuffer(s.raw_data, dtype=np.int16).copy()
+    n_frames = len(arr) // channels
+    if n_frames <= 0:
+        return bg_seg
+    arr_2d = arr[:n_frames * channels].reshape((n_frames, channels)).astype(np.float32)
+    gain = float(10.0 ** (-float(duck_db) / 20.0))
+
+    for s_ms, e_ms in merged_intervals:
+        duration_ms = e_ms - s_ms
+        if duration_ms < 100:
+            continue
+        s_idx = max(0, min(n_frames, int(round(s_ms * frame_rate / 1000.0))))
+        e_idx = max(0, min(n_frames, int(round(e_ms * frame_rate / 1000.0))))
+        if e_idx <= s_idx:
+            continue
+        fade_ms = min(200, int(duration_ms / 2))
+        fade_frames = int(round(fade_ms * frame_rate / 1000.0))
+        seg_frames = e_idx - s_idx
+        if fade_ms > 10 and fade_frames * 2 <= seg_frames and fade_frames > 0:
+            ramp_down = np.linspace(1.0, gain, fade_frames, dtype=np.float32)[:, None]
+            ramp_up = np.linspace(gain, 1.0, fade_frames, dtype=np.float32)[:, None]
+            arr_2d[s_idx:s_idx + fade_frames] *= ramp_down
+            arr_2d[s_idx + fade_frames:e_idx - fade_frames] *= gain
+            arr_2d[e_idx - fade_frames:e_idx] *= ramp_up
+        else:
+            arr_2d[s_idx:e_idx] *= gain
+
+    np.clip(arr_2d, -32768.0, 32767.0, out=arr_2d)
+    out_bytes = arr_2d.astype(np.int16).tobytes()
+    return AudioSegment(
+        data=out_bytes,
+        sample_width=2,
+        frame_rate=frame_rate,
+        channels=channels,
+    )
+
 
 class Dubber:
     def __init__(self, settings, api_keys, log_callback=None, progress_callback=None):
@@ -636,15 +776,25 @@ class Dubber:
 
     async def run_demucs(self, audio_path, output_dir):
         """Runs local Demucs to isolate vocals and background stems with low-PC optimizations."""
-        mixer = self.settings.get("mixer", {})
-        def is_stem_active(stem):
+        mixer = self.settings.get("mixer", {"drums": True, "bass": True, "melody": True})
+        def get_stem_vol(stem):
             try:
-                return bool(mixer.get(stem) and float(mixer.get(f"{stem}_vol", 100)) > 0)
+                if not mixer.get(stem, True):
+                    return 0.0
+                return float(mixer.get(f"{stem}_vol", 100))
             except (ValueError, TypeError):
-                return bool(mixer.get(stem))
-        need_individual_stems = is_stem_active("drums") or is_stem_active("bass") or is_stem_active("melody")
+                return 100.0 if mixer.get(stem, True) else 0.0
+
+        d_vol = get_stem_vol("drums")
+        b_vol = get_stem_vol("bass")
+        m_vol = get_stem_vol("melody")
+        # When all 3 stems are enabled at default 100% (or all muted), drums + bass + melody == no_vocals.wav.
+        # Only pay for 4-stem disk I/O if the user selectively muted one stem or set custom unequal stem volumes.
+        all_default_100 = (abs(d_vol - 100.0) < 1.0 and abs(b_vol - 100.0) < 1.0 and abs(m_vol - 100.0) < 1.0)
+        all_muted = (d_vol <= 0.0 and b_vol <= 0.0 and m_vol <= 0.0)
+        need_individual_stems = not (all_default_100 or all_muted)
         mode_label = "Full 4-Stem" if need_individual_stems else "High-Speed 2-Stem"
-        self.log(f"Running Demucs vocal separation ({mode_label}, shifts=0 for max speed)...", "info")
+        self.log(f"Running Demucs vocal separation ({mode_label}, shifts=0, overlap=0.1 for max speed)...", "info")
         
         # Demucs python module invocation
         cmd = [
@@ -653,6 +803,7 @@ class Dubber:
             "-j", "2",
             "--segment", "7",
             "--shifts", "0",
+            "--overlap", "0.1",
             "--out", output_dir
         ]
         
@@ -777,6 +928,98 @@ class Dubber:
                 custom_ref = self.settings.get("custom_male_voice_path") if is_male else self.settings.get("custom_female_voice_path")
             custom_ref = resolve_voice_path(custom_ref)
 
+        # Fallback to default custom_voices/ sample if user did not explicitly browse one
+        if not custom_ref:
+            default_sample_name = "Male_1.wav" if is_male else "Female_1.wav"
+            if age_group == "young" or "child" in str(age_group):
+                default_sample_name = "ក្មេងប្រុស.wav" if is_male else "ក្មេងស្រី.mp3"
+            elif age_group == "old" or "elder" in str(age_group):
+                default_sample_name = "ចាស់ប្រុស.wav" if is_male else "ចាស់ស្រី.wav"
+            custom_ref = resolve_voice_path(default_sample_name)
+
+        # TEST 2: Hybrid Edge-TTS (Khmer Reader) + OpenVoiceV2 Tone-Color Converter (131 MB VRAM)
+        if tts_engine == "edge-openvoice":
+            target_lang = self.settings.get("target_lang", "km-KH")
+            edge_voice = "en-US-GuyNeural" if is_male else "en-US-JennyNeural"
+            if target_lang in VOICES:
+                edge_voice = VOICES[target_lang][0] if is_male else VOICES[target_lang][1]
+
+            rate_str = "+0%"
+            if speed_ratio != 1.0:
+                rate_diff = int((speed_ratio - 1.0) * 100)
+                rate_str = f"+{rate_diff}%" if rate_diff >= 0 else f"{rate_diff}%"
+
+            clean_text = re.sub(r"\[.*?\]", "", text or "")
+            clean_text = re.sub(r"\(.*?\)", "", clean_text)
+            clean_text = re.sub(r"[\*\_\#\`]", "", clean_text).strip()
+            clean_text = re.sub(r"\s+", " ", clean_text)
+
+            if not clean_text or clean_text in ["...", "…", "-", ""]:
+                AudioSegment.silent(duration=300).export(output_path, format="mp3")
+                return
+
+            import edge_tts  # type: ignore
+            import soundfile as sf  # type: ignore
+            temp_edge_mp3 = output_path + f".edge_base_{uuid.uuid4().hex[:6]}.mp3"
+            temp_conv_wav = output_path + f".ov2_conv_{uuid.uuid4().hex[:6]}.wav"
+            try:
+                for edge_attempt in range(1, 5):
+                    try:
+                        communicate = edge_tts.Communicate(clean_text, edge_voice, rate=rate_str)
+                        await communicate.save(temp_edge_mp3)
+                        if os.path.exists(temp_edge_mp3) and os.path.getsize(temp_edge_mp3) > 100:
+                            break
+                    except Exception as e:
+                        if edge_attempt < 4:
+                            await asyncio.sleep(1.0 * edge_attempt)
+                        else:
+                            raise e
+
+                if not custom_ref or not os.path.exists(custom_ref):
+                    shutil.copy(temp_edge_mp3, output_path)
+                    self.log(f"Synthesized via Edge-TTS ({edge_voice}) [No reference .wav found for conversion]", "info")
+                    return
+
+                role_type = "Narrator" if is_narrator else "Actor"
+                actor_label = f"Male {role_type}" if is_male else f"Female {role_type}"
+                self.log(
+                    f"Converting Edge-TTS ({edge_voice}) -> OpenVoiceV2 Clone [{actor_label}: {os.path.basename(custom_ref)}]...",
+                    "info",
+                )
+
+                loop = asyncio.get_event_loop()
+                gpu_setting = self.settings.get("gpu_mode", "auto")
+                device_target = "cpu" if gpu_setting == "cpu" else "cuda"
+
+                def run_ov2_conversion():
+                    converter = get_local_openvoice_converter(device=device_target)
+                    wav_np, sr = converter.convert_file(temp_edge_mp3, custom_ref, tau=0.3)
+                    if output_path.lower().endswith(".wav"):
+                        sf.write(output_path, wav_np, sr)
+                    else:
+                        sf.write(temp_conv_wav, wav_np, sr)
+                        seg = AudioSegment.from_wav(temp_conv_wav)
+                        seg.export(output_path, format="mp3", bitrate="192k")
+                    return output_path
+
+                async with get_voxcpm_lock():
+                    await loop.run_in_executor(None, run_ov2_conversion)
+                return
+            except Exception as ov_err:
+                self.log(f"OpenVoiceV2 conversion fallback to base Edge-TTS ({ov_err})", "warning")
+                if os.path.exists(temp_edge_mp3) and os.path.getsize(temp_edge_mp3) > 100:
+                    shutil.copy(temp_edge_mp3, output_path)
+                else:
+                    AudioSegment.silent(duration=500).export(output_path, format="mp3")
+                return
+            finally:
+                for tmp_f in (temp_edge_mp3, temp_conv_wav):
+                    try:
+                        if os.path.exists(tmp_f):
+                            os.remove(tmp_f)
+                    except Exception:
+                        pass
+
         # Ultimate clone mode logic (transcript-guided cloning)
         use_prompt = False
         prompt_txt = ""
@@ -793,7 +1036,8 @@ class Dubber:
                 clone_str = f" [Voice Clone: {os.path.basename(custom_ref)}]" if custom_ref else " [Default Voice]"
                 if use_prompt:
                     clone_str += " (Ultimate Clone Mode)"
-                self.log(f"Synthesizing segment via Local VoxCPM2 ({actor_label}{clone_str}) [{emotion}] (Attempt {attempt})...", "info")
+                engine_label = "VoxCPM2 4GB INT8 Engine"
+                self.log(f"Synthesizing segment via {engine_label} ({actor_label}{clone_str}) [{emotion}] (Attempt {attempt})...", "info")
                 loop = asyncio.get_event_loop()
                 
                 def run_local_synthesis():
@@ -841,12 +1085,12 @@ class Dubber:
 
                     gpu_setting = self.settings.get("gpu_mode", "auto")
                     device_target = "cpu" if gpu_setting == "cpu" else "cuda"
-                    local_model = get_local_voxcpm_model(device=device_target)
+                    local_model = get_local_voxcpm_4gb_model(device=device_target)
 
                     gen_kwargs = {
                         "text": target_text,
                         "cfg_value": cfg_val,
-                        "inference_timesteps": 10
+                        "inference_timesteps": 8
                     }
                     if custom_ref and os.path.exists(custom_ref):
                         if use_prompt and prompt_txt:
@@ -858,19 +1102,18 @@ class Dubber:
 
                     wav = local_model.generate(**gen_kwargs)
 
-                    temp_wav = output_path + f".tmp_{uuid.uuid4().hex[:6]}.wav"
-                    sf.write(temp_wav, wav, 48000)
-                    if output_path.lower().endswith(".mp3"):
+                    if output_path.lower().endswith(".wav"):
+                        sf.write(output_path, wav, 48000)
+                    else:
+                        temp_wav = output_path + f".tmp_{uuid.uuid4().hex[:6]}.wav"
+                        sf.write(temp_wav, wav, 48000)
                         seg = AudioSegment.from_wav(temp_wav)
                         seg.export(output_path, format="mp3", bitrate="192k")
-                    else:
-                        shutil.copy(temp_wav, output_path)
-
-                    try:
-                        if os.path.exists(temp_wav):
-                            os.remove(temp_wav)
-                    except Exception:
-                        pass
+                        try:
+                            if os.path.exists(temp_wav):
+                                os.remove(temp_wav)
+                        except Exception:
+                            pass
                     return output_path
 
                 async with get_voxcpm_lock():
@@ -1296,11 +1539,11 @@ class Dubber:
         if need_audio:
             upload_target_path = audio_file_path
             file_sz = os.path.getsize(upload_target_path)
-            if file_sz > 10 * 1024 * 1024 and str(audio_file_path).lower().endswith(".wav"):
+            if file_sz > 2 * 1024 * 1024 and str(audio_file_path).lower().endswith(".wav"):
                 compressed_mp3 = os.path.join(self.temp_dir, "gemini_upload_compressed.mp3")
                 if not os.path.exists(compressed_mp3) or os.path.getsize(compressed_mp3) == 0:
-                    self.log(f"Compressing vocals ({file_sz / (1024*1024):.1f} MB) to 128k MP3 for faster upload...", "info")
-                    compress_cmd = [get_ffmpeg_cmd(), "-y", "-i", audio_file_path, "-b:a", "128k", compressed_mp3]
+                    self.log(f"Compressing vocals ({file_sz / (1024*1024):.1f} MB) to 16kHz 48k Mono MP3 for fast upload...", "info")
+                    compress_cmd = [get_ffmpeg_cmd(), "-y", "-i", audio_file_path, "-ac", "1", "-ar", "16000", "-b:a", "48k", compressed_mp3]
                     await self.async_run_cmd(compress_cmd, "Audio Compression for Gemini Upload")
                 if os.path.exists(compressed_mp3) and os.path.getsize(compressed_mp3) > 0:
                     upload_target_path = compressed_mp3
@@ -1518,52 +1761,44 @@ class Dubber:
 
                         loop = asyncio.get_event_loop()
                         def load_whisper():
-                            global global_whisper_model
+                            global global_whisper_model, global_voxcpm_4gb_model
+                            if global_voxcpm_4gb_model is not None:
+                                try:
+                                    global_voxcpm_4gb_model.offload_to_ram()
+                                except Exception:
+                                    pass
                             if global_whisper_model is not None:
+                                try:
+                                    if hasattr(global_whisper_model, "model") and hasattr(global_whisper_model.model, "load_model"):
+                                        global_whisper_model.model.load_model()
+                                except Exception:
+                                    pass
                                 return global_whisper_model
 
-                            import subprocess
-                            import sys
-                        
+                            os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+                            os.environ['OMP_NUM_THREADS'] = '1'
+
                             if device == "cuda":
                                 comp_types = ["float16", "int8_float16", "int8", "float32"]
                                 try:
                                     major, minor = torch.cuda.get_device_capability(0)
                                     if major < 7:
-                                        self.log(f"GPU Compute Capability {major}.{minor} detected (Pascal or older). Skipping float16 options.", "info")
+                                        self.log(f"GPU Compute Capability {major}.{minor} detected (Pascal or older). Using int8 directly.", "info")
                                         comp_types = ["int8", "float32"]
                                 except Exception as cap_err:
                                     self.log(f"Failed to query GPU Compute Capability: {cap_err}", "warning")
-                            
+
                                 for comp_type in comp_types:
                                     try:
-                                        self.log(f"Attempting to load Faster-Whisper on CUDA with compute_type={comp_type}...", "info")
-                                        test_script = f"import os\nos.environ['KMP_DUPLICATE_LIB_OK']='TRUE'\nos.environ['OMP_NUM_THREADS']='1'\nfrom faster_whisper import WhisperModel\nWhisperModel(r'''{model_path}''', device='cuda', compute_type='{comp_type}')"
-                                        proc = subprocess.run([sys.executable, "-c", test_script], capture_output=True, env=self.get_clean_env())
-                                    
-                                        if proc.returncode != 0:
-                                            err_msg = proc.stderr.decode('utf-8', errors='ignore') if proc.stderr else ''
-                                            raise RuntimeError(f"CUDA Subprocess crashed (Exit Code: {proc.returncode}). Error details: {err_msg}")
-                                        
-                                        os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-                                        os.environ['OMP_NUM_THREADS'] = '1'
+                                        self.log(f"Loading Faster-Whisper on CUDA with compute_type={comp_type}...", "info")
                                         wm = WhisperModel(model_path, device="cuda", compute_type=comp_type)
                                         self.log(f"Successfully loaded Faster-Whisper on CUDA with compute_type={comp_type}.", "success")
                                         global_whisper_model = wm
                                         return wm
                                     except Exception as e:
                                         self.log(f"Failed loading on CUDA with {comp_type}: {e}", "warning")
-                        
+
                             self.log("Loading Faster-Whisper on CPU with compute_type=int8...", "info")
-                            test_script_cpu = f"import os\nos.environ['KMP_DUPLICATE_LIB_OK']='TRUE'\nos.environ['OMP_NUM_THREADS']='1'\nfrom faster_whisper import WhisperModel\nWhisperModel(r'''{model_path}''', device='cpu', compute_type='int8')"
-                            proc_cpu = subprocess.run([sys.executable, "-c", test_script_cpu], capture_output=True, env=self.get_clean_env())
-                        
-                            if proc_cpu.returncode != 0:
-                                err_msg_cpu = proc_cpu.stderr.decode('utf-8', errors='ignore') if proc_cpu.stderr else ''
-                                raise RuntimeError(f"CPU Subprocess crashed (Exit Code: {proc_cpu.returncode}). Error details: {err_msg_cpu}")
-                            
-                            os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-                            os.environ['OMP_NUM_THREADS'] = '1'
                             wm = WhisperModel(model_path, device="cpu", compute_type="int8")
                             self.log("Successfully loaded Faster-Whisper on CPU.", "success")
                             global_whisper_model = wm
@@ -1578,22 +1813,63 @@ class Dubber:
                                 best_of=1,
                                 vad_filter=False,
                                 condition_on_previous_text=False,
-                                word_timestamps=True
+                                word_timestamps=False
                             )
                             return list(segs_gen)
                     
                         segs = await loop.run_in_executor(None, run_transcription)
+
+                        # Acoustic onset/offset trimmer + hallucination filter on vocals_wav (replaces buggy word_timestamps DTW seek jump)
+                        import numpy as np
+                        voc_arr_16k = None
+                        try:
+                            voc_seg_16k = AudioSegment.from_wav(vocals_wav).set_channels(1).set_frame_rate(16000).set_sample_width(2)
+                            voc_arr_16k = np.frombuffer(voc_seg_16k.raw_data, dtype=np.int16).astype(np.float32) / 32768.0
+                        except Exception:
+                            voc_arr_16k = None
+
+                        hallucination_substrings = (
+                            "优优独播剧场", "yoyo television", "ming pao", "amara.org",
+                            "字幕志愿者", "感谢观看", "谢谢观看", "请不吝点赞", "订阅转发"
+                        )
                     
                         prev_txt = ""
                         prev_end = 0.0
                         for s in segs:
                             txt = s.text.strip()
                             if txt:
-                                w_start = round(s.words[0].start, 3) if (s.words and s.words[0].start is not None) else round(s.start, 3)
-                                w_end = round(s.words[-1].end, 3) if (s.words and s.words[-1].end is not None) else round(s.end, 3)
+                                txt_low = txt.lower()
+                                if any(h in txt_low for h in hallucination_substrings):
+                                    continue
+
+                                w_start = round(s.start, 3)
+                                w_end = round(min(original_duration_s, s.end), 3)
                                 if w_end <= w_start:
-                                    w_start = round(s.start, 3)
-                                    w_end = round(s.end, 3)
+                                    continue
+
+                                if voc_arr_16k is not None:
+                                    s_i = max(0, int(w_start * 16000))
+                                    e_i = min(len(voc_arr_16k), int(w_end * 16000))
+                                    if e_i - s_i >= 800:
+                                        chunk_16k = voc_arr_16k[s_i:e_i]
+                                        overall_db = 20.0 * float(np.log10(np.sqrt(np.mean(chunk_16k ** 2)) + 1e-9))
+                                        # Drop pure silence hallucinations (< -50 dB)
+                                        if overall_db < -50.0:
+                                            continue
+                                        # Trim leading silence if Whisper attached preceding pause (> 1.2s span) to segment start
+                                        if (w_end - w_start) > 1.2:
+                                            win = 400  # 25ms frame at 16kHz
+                                            n_w = (e_i - s_i) // win
+                                            if n_w > 2:
+                                                frames = chunk_16k[:n_w * win].reshape(n_w, win)
+                                                rms_db = 20.0 * np.log10(np.sqrt(np.mean(frames ** 2, axis=1)) + 1e-9)
+                                                peak_db = float(np.max(rms_db))
+                                                thresh_db = max(-36.0, min(-24.0, peak_db - 14.0))
+                                                active_idx = np.where(rms_db > thresh_db)[0]
+                                                if len(active_idx) > 0:
+                                                    trimmed_start = round(max(w_start, w_start + (int(active_idx[0]) * 0.025) - 0.06), 3)
+                                                    if w_end - trimmed_start >= 0.35:
+                                                        w_start = trimmed_start
 
                                 # Skip immediate consecutive identical text repeats within 1.0s
                                 if txt == prev_txt and abs(w_start - prev_end) < 1.0:
@@ -1803,8 +2079,9 @@ class Dubber:
                     batches = [whisper_segments_list[i:i + batch_size] for i in range(0, len(whisper_segments_list), batch_size)]
                     self.log(f"Whisper transcript has {len(whisper_segments_list)} segments. Processing in {len(batches)} batches of ~{batch_size} via cached File API handle...", "info")
                     
-                    segments = []
-                    for b_idx, batch_segs in enumerate(batches, 1):
+                    batch_sem = asyncio.Semaphore(3)
+
+                    async def _run_batch(b_idx, batch_segs):
                         self.log(f"Translating dialogue batch {b_idx}/{len(batches)} ({len(batch_segs)} segments)...", "info")
                         b_json_str = json.dumps(batch_segs, ensure_ascii=False, indent=2)
                         b_prompt = f"""
@@ -1841,14 +2118,14 @@ class Dubber:
                         if locked_speaker_roles and not movie_recap_mode:
                             b_prompt += f"\n\nCRITICAL SPEAKER LOCKING: Match character voices against reference audios."
                         
-                        async with get_gemini_lock():
-                            b_raw = await self.call_gemini_with_retry(
-                                vocals_wav,
-                                b_prompt,
-                                reference_audios=recap_refs,
-                                expected_segments=len(batch_segs)
-                            )
-                        raw_response += f"\n--- BATCH {b_idx} ---\n" + b_raw
+                        async with batch_sem:
+                            async with get_gemini_lock():
+                                b_raw = await self.call_gemini_with_retry(
+                                    vocals_wav,
+                                    b_prompt,
+                                    reference_audios=recap_refs,
+                                    expected_segments=len(batch_segs)
+                                )
                         
                         b_clean = extract_json_payload(b_raw)
                         b_clean = re.sub(r',\s*([\]}])', r'\1', b_clean)
@@ -1864,11 +2141,12 @@ class Dubber:
                                 b_parsed = []
                                 
                         if isinstance(b_parsed, list) and len(b_parsed) > 0:
-                            segments.extend(b_parsed)
+                            out_segs = b_parsed
                         else:
                             self.log(f"[WARNING] Batch {b_idx} JSON parsing incomplete. Falling back to original segments.", "warning")
+                            out_segs = []
                             for seg in batch_segs:
-                                segments.append({
+                                out_segs.append({
                                     "id": seg.get("id"),
                                     "start": seg.get("start", 0.0),
                                     "end": seg.get("end", 1.0),
@@ -1878,6 +2156,21 @@ class Dubber:
                                     "speaker_role": "lead_actor",
                                     "emotion": "calm"
                                 })
+                        return b_idx, b_raw, out_segs
+
+                    # Warm up sticky File API cache with Batch 1 first, then fire remaining batches concurrently
+                    first_res = await _run_batch(1, batches[0])
+                    batch_results = [first_res]
+                    if len(batches) > 1:
+                        rem_tasks = [_run_batch(idx, b_segs) for idx, b_segs in enumerate(batches[1:], 2)]
+                        rem_results = await asyncio.gather(*rem_tasks)
+                        batch_results.extend(rem_results)
+
+                    batch_results.sort(key=lambda x: x[0])
+                    segments = []
+                    for b_idx, b_raw, out_segs in batch_results:
+                        raw_response += f"\n--- BATCH {b_idx} ---\n" + b_raw
+                        segments.extend(out_segs)
                             
                     self.log(f"All {len(batches)} batches processed successfully. Received {len(segments)} segments total.", "success")
                 else:
@@ -2104,7 +2397,8 @@ class Dubber:
             male_voice, female_voice = VOICES.get(lang_code, VOICES["km-KH"])
             
             # CONCURRENT TTS SYNTHESIS BLOCK
-            sem = asyncio.Semaphore(2 if self.settings.get("tts_engine", "edge-tts") == "edge-tts" else 4)
+            tts_eng = self.settings.get("tts_engine", "edge-tts")
+            sem = asyncio.Semaphore(6 if tts_eng in ("edge-tts", "edge-openvoice") else 4)
 
             async def process_segment(idx, seg):
                 seg_id = seg.get("id") or (idx + 1)
@@ -2171,33 +2465,39 @@ class Dubber:
                 gender_label = "narrator male" if (is_male_segment and is_narrator_segment) else ("narrator female" if is_narrator_segment else ("male" if is_male_segment else "female"))
                 self.log(f"Dubbing segment {seg_id}/{len(segments)} [{start:.2f}s - {end:.2f}s] ({gender_label}) [{emotion}]: {text_to_speak}", "muted")
                 
-                temp_tts_path = os.path.join(self.temp_dir, f"seg_{seg_id}_raw.mp3")
+                raw_ext = "mp3" if tts_eng == "edge-tts" else "wav"
+                temp_tts_path = os.path.join(self.temp_dir, f"seg_{seg_id}_raw.{raw_ext}")
                 temp_stretch_path = os.path.join(self.temp_dir, f"seg_{seg_id}_stretched.wav")
+
+                # Calculate required duration & look ahead to next segment to allow natural pacing
+                target_dur = max(0.1, end - start)
+                next_start = original_duration_s
+                if idx + 1 < len(segments):
+                    next_start = float(segments[idx + 1].get("start", original_duration_s))
+                max_allowed_dur = max(target_dur, next_start - start - 0.15)
+
+                pre_rate = 1.0
+                if not movie_recap_mode and tts_eng in ("edge-tts", "edge-openvoice"):
+                    est_cps = 9.5 if lang_code in ("km-KH", "th-TH", "my-MM") else 13.5
+                    est_dur = len(text_to_speak) / est_cps
+                    if est_dur > max_allowed_dur * 1.08:
+                        pre_rate = min(1.30, max(1.0, est_dur / max_allowed_dur))
                 
                 # SYNTHESIZE WITH SEMAPHORE TO PREVENT API RATE LIMITING
                 async with sem:
-                    await self.synthesize_tts(text_to_speak, selected_voice, temp_tts_path, is_male=is_male_segment, is_narrator=is_narrator_segment, emotion=emotion, age_group=seg.get("age_group", "adult"))
+                    await self.synthesize_tts(text_to_speak, selected_voice, temp_tts_path, speed_ratio=pre_rate, is_male=is_male_segment, is_narrator=is_narrator_segment, emotion=emotion, age_group=seg.get("age_group", "adult"))
                 
                 if not os.path.exists(temp_tts_path) or os.path.getsize(temp_tts_path) == 0:
                     self.log(f"TTS audio output empty for segment {seg_id}. Skipping.", "warning")
                     return None
 
                 # Get actual TTS duration
-                tts_segment = AudioSegment.from_file(temp_tts_path)
+                tts_segment = AudioSegment.from_wav(temp_tts_path) if raw_ext == "wav" else AudioSegment.from_file(temp_tts_path)
 
                 if movie_recap_mode:
                     # In recap mode, allow narration to play naturally at 1.0x without chopping or artificial speedup
                     final_seg = tts_segment
                 else:
-                    # Calculate required duration & look ahead to next segment to allow natural pacing
-                    target_dur = max(0.1, end - start)
-                    next_start = original_duration_s
-                    if idx + 1 < len(segments):
-                        next_start = float(segments[idx + 1].get("start", original_duration_s))
-                    
-                    # Allow audio to breathe into natural silence before next dialogue (leave 0.15s gap)
-                    max_allowed_dur = max(target_dur, next_start - start - 0.15)
-                    
                     max_user_speed = float(self.settings.get("max_speech_speed", 1.5))
                     # Dynamic auto-fit: If user hasn't set an aggressive speed limit (or has 1.0 baseline),
                     # allow dynamic auto-stretch up to 1.45x so character dialogue never gets brutally cut off
@@ -2314,7 +2614,9 @@ class Dubber:
                         seg["end"] = end_s
                         
                         pos_ms = int(start_s * 1000.0)
-                        dubbed_audio = dubbed_audio.overlay(placed_audio, position=pos_ms)
+                        if "recap_placements" not in locals():
+                            recap_placements = []
+                        recap_placements.append((pos_ms, placed_audio))
                         
                         try:
                             seg_preview_dir = os.path.join(get_subtitles_dir(), str(video_id))
@@ -2324,8 +2626,11 @@ class Dubber:
                             pass
                             
                         curr_pos_s = end_s + max(0.4, gap)
+                    if "recap_placements" in locals() and recap_placements:
+                        dubbed_audio = fast_overlay_segments(original_duration_ms, recap_placements)
             else:
-                # Synchronously overlay results onto dubbed timeline
+                # Overlay results onto dubbed timeline in a single O(N) NumPy pass
+                placements = []
                 for result in results:
                     if isinstance(result, Exception):
                         self.log(f"Segment processing failed due to exception: {result}", "error")
@@ -2335,7 +2640,8 @@ class Dubber:
                     start, final_seg = result
                     sync_offset_ms = float(self.settings.get("audio_sync_offset_ms", 0))
                     target_pos_ms = max(0, int((start * 1000.0) + sync_offset_ms))
-                    dubbed_audio = dubbed_audio.overlay(final_seg, position=target_pos_ms)
+                    placements.append((target_pos_ms, final_seg))
+                dubbed_audio = fast_overlay_segments(original_duration_ms, placements)
             
 
             
@@ -2441,29 +2747,8 @@ class Dubber:
                         else:
                             merged_intervals.append([s_ms, e_ms])
 
-                # Process ducking with crossfades to prevent clicks and pop sounds
-                for s_ms, e_ms in merged_intervals:
-                    duration = e_ms - s_ms
-                    if duration < 100:
-                        continue
-                    
-                    original_chunk = bg_mixed[s_ms:e_ms]
-                    ducked_chunk = original_chunk - duck_db
-                    
-                    fade_ms = min(200, int(duration / 2))
-                    if fade_ms > 10:
-                        start_fade = original_chunk[:fade_ms]
-                        start_fade_ducked = ducked_chunk[:fade_ms]
-                        start_transition = start_fade.fade_out(fade_ms).overlay(start_fade_ducked.fade_in(fade_ms))
-                        
-                        end_fade = original_chunk[-fade_ms:]
-                        end_fade_ducked = ducked_chunk[-fade_ms:]
-                        end_transition = end_fade_ducked.fade_out(fade_ms).overlay(end_fade.fade_in(fade_ms))
-                        
-                        mid_section = ducked_chunk[fade_ms:-fade_ms]
-                        bg_mixed = bg_mixed[:s_ms] + start_transition + mid_section + end_transition + bg_mixed[e_ms:]
-                    else:
-                        bg_mixed = bg_mixed[:s_ms] + ducked_chunk + bg_mixed[e_ms:]
+                # Process ducking with crossfades in a single O(N) NumPy pass
+                bg_mixed = fast_duck_audio_segment(bg_mixed, merged_intervals, duck_db)
 
             # Final Audio Mix
             final_audio = bg_mixed.overlay(dubbed_audio)
@@ -2629,7 +2914,8 @@ class Dubber:
             male_voice, female_voice = VOICES.get(lang_code, VOICES["km-KH"])
             
             seg_preview_dir = os.path.join(get_subtitles_dir(), str(video_id))
-            sem = asyncio.Semaphore(2 if self.settings.get("tts_engine", "edge-tts") == "edge-tts" else 4)
+            tts_eng = self.settings.get("tts_engine", "edge-tts")
+            sem = asyncio.Semaphore(6 if tts_eng in ("edge-tts", "edge-openvoice") else 4)
             
             async def process_re_dub_segment(idx, seg):
                 seg_id = seg.get("id") or (idx + 1)
@@ -2715,31 +3001,37 @@ class Dubber:
                     emotion = str(seg.get("emotion", "dramatic")).lower().strip()
                     self.log(f"Synthesizing segment {seg_id}/{len(segments)} [{start:.2f}s - {end:.2f}s]: {text_to_speak}", "muted")
                     
-                    temp_tts_path = os.path.join(self.temp_dir, f"seg_{seg_id}_raw.mp3")
+                    raw_ext = "mp3" if tts_eng == "edge-tts" else "wav"
+                    temp_tts_path = os.path.join(self.temp_dir, f"seg_{seg_id}_raw.{raw_ext}")
                     temp_stretch_path = os.path.join(self.temp_dir, f"seg_{seg_id}_stretched.wav")
+
+                    next_start = original_duration_s
+                    if idx + 1 < len(segments):
+                        next_start = float(segments[idx + 1].get("start", original_duration_s))
+                    max_allowed_dur = max(target_dur, next_start - start - 0.15)
+
+                    pre_rate = 1.0
+                    if not self.settings.get("movie_recap_mode", False) and tts_eng in ("edge-tts", "edge-openvoice"):
+                        est_cps = 9.5 if lang_code in ("km-KH", "th-TH", "my-MM") else 13.5
+                        est_dur = len(text_to_speak) / est_cps
+                        if est_dur > max_allowed_dur * 1.08:
+                            pre_rate = min(1.30, max(1.0, est_dur / max_allowed_dur))
                     
                     # Synthesize
                     async with sem:
-                        await self.synthesize_tts(text_to_speak, selected_voice, temp_tts_path, is_male=is_male_segment, is_narrator=is_narrator_segment, emotion=emotion, age_group=seg.get("age_group", "adult"))
+                        await self.synthesize_tts(text_to_speak, selected_voice, temp_tts_path, speed_ratio=pre_rate, is_male=is_male_segment, is_narrator=is_narrator_segment, emotion=emotion, age_group=seg.get("age_group", "adult"))
                     
                     if not os.path.exists(temp_tts_path) or os.path.getsize(temp_tts_path) == 0:
                         return None
 
                     # Get actual TTS duration
-                    tts_segment = AudioSegment.from_file(temp_tts_path)
+                    tts_segment = AudioSegment.from_wav(temp_tts_path) if raw_ext == "wav" else AudioSegment.from_file(temp_tts_path)
                     
                     if self.settings.get("movie_recap_mode", False):
                         # In recap mode, allow narration to play naturally at 1.0x without chopping or artificial speedup
                         final_seg = tts_segment
                     else:
                         tts_dur = len(tts_segment) / 1000.0
-                        
-                        # Determine when the next dialogue begins
-                        next_start = original_duration_s
-                        if idx + 1 < len(segments):
-                            next_start = float(segments[idx + 1].get("start", original_duration_s))
-                        
-                        max_allowed_dur = max(target_dur, next_start - start - 0.15)
                         
                         # Speed stretch logic
                         if tts_dur <= target_dur:
@@ -2842,7 +3134,9 @@ class Dubber:
                         seg["end"] = end_s
                         
                         pos_ms = int(start_s * 1000.0)
-                        dubbed_audio = dubbed_audio.overlay(placed_audio, position=pos_ms)
+                        if "redub_recap_placements" not in locals():
+                            redub_recap_placements = []
+                        redub_recap_placements.append((pos_ms, placed_audio))
                         
                         try:
                             seg_preview_dir = os.path.join(get_subtitles_dir(), str(video_id))
@@ -2852,7 +3146,10 @@ class Dubber:
                             pass
                             
                         curr_pos_s = end_s + max(0.4, gap)
+                    if "redub_recap_placements" in locals() and redub_recap_placements:
+                        dubbed_audio = fast_overlay_segments(original_duration_ms, redub_recap_placements)
             else:
+                redub_placements = []
                 for res in re_dub_results:
                     if isinstance(res, Exception):
                         self.log(f"Segment re-dub failed: {res}", "error")
@@ -2862,7 +3159,8 @@ class Dubber:
                     seg_start, final_seg = res
                     sync_offset_ms = float(self.settings.get("audio_sync_offset_ms", 0))
                     target_pos_ms = max(0, int((seg_start * 1000.0) + sync_offset_ms))
-                    dubbed_audio = dubbed_audio.overlay(final_seg, position=target_pos_ms)
+                    redub_placements.append((target_pos_ms, final_seg))
+                dubbed_audio = fast_overlay_segments(original_duration_ms, redub_placements)
             
 
 
@@ -2929,28 +3227,7 @@ class Dubber:
                         else:
                             merged_intervals.append([s_ms, e_ms])
 
-                for s_ms, e_ms in merged_intervals:
-                    duration = e_ms - s_ms
-                    if duration < 100:
-                        continue
-                    
-                    original_chunk = bg_mixed[s_ms:e_ms]
-                    ducked_chunk = original_chunk - duck_db
-                    
-                    fade_ms = min(200, int(duration / 2))
-                    if fade_ms > 10:
-                        start_fade = original_chunk[:fade_ms]
-                        start_fade_ducked = ducked_chunk[:fade_ms]
-                        start_transition = start_fade.fade_out(fade_ms).overlay(start_fade_ducked.fade_in(fade_ms))
-                        
-                        end_fade = original_chunk[-fade_ms:]
-                        end_fade_ducked = ducked_chunk[-fade_ms:]
-                        end_transition = end_fade_ducked.fade_out(fade_ms).overlay(end_fade.fade_in(fade_ms))
-                        
-                        mid_section = ducked_chunk[fade_ms:-fade_ms]
-                        bg_mixed = bg_mixed[:s_ms] + start_transition + mid_section + end_transition + bg_mixed[e_ms:]
-                    else:
-                        bg_mixed = bg_mixed[:s_ms] + ducked_chunk + bg_mixed[e_ms:]
+                bg_mixed = fast_duck_audio_segment(bg_mixed, merged_intervals, duck_db)
             
             final_audio = bg_mixed.overlay(dubbed_audio)
             final_audio_path = os.path.join(self.temp_dir, "final_mixed_audio.wav")
@@ -3138,13 +3415,15 @@ class Dubber:
                 
                 emotion = str(target_seg.get("emotion", "dramatic")).lower().strip()
                 
-                temp_tts_path = os.path.join(self.temp_dir, f"seg_{target_seg_id}_raw.mp3")
+                tts_eng = self.settings.get("tts_engine", "edge-tts")
+                raw_ext = "mp3" if tts_eng == "edge-tts" else "wav"
+                temp_tts_path = os.path.join(self.temp_dir, f"seg_{target_seg_id}_raw.{raw_ext}")
                 temp_stretch_path = os.path.join(self.temp_dir, f"seg_{target_seg_id}_stretched.wav")
                 
                 await self.synthesize_tts(text_to_speak, selected_voice, temp_tts_path, is_male=is_male_segment, is_narrator=is_narrator_segment, emotion=emotion, age_group=target_seg.get("age_group", "adult"))
                 
                 if os.path.exists(temp_tts_path) and os.path.getsize(temp_tts_path) > 0:
-                    tts_segment = AudioSegment.from_file(temp_tts_path)
+                    tts_segment = AudioSegment.from_wav(temp_tts_path) if raw_ext == "wav" else AudioSegment.from_file(temp_tts_path)
                     tts_dur = len(tts_segment) / 1000.0
                     
                     # Calculate speed stretch
@@ -3251,12 +3530,14 @@ class Dubber:
                         s_selected_voice = male_voice if s_is_male else female_voice
                         s_emotion = str(seg.get("emotion", "dramatic")).lower().strip()
                         
-                        t_raw = os.path.join(self.temp_dir, f"seg_{s_id}_raw.mp3")
+                        tts_eng = self.settings.get("tts_engine", "edge-tts")
+                        raw_ext = "mp3" if tts_eng == "edge-tts" else "wav"
+                        t_raw = os.path.join(self.temp_dir, f"seg_{s_id}_raw.{raw_ext}")
                         t_str = os.path.join(self.temp_dir, f"seg_{s_id}_stretched.wav")
                         
                         await self.synthesize_tts(s_text, s_selected_voice, t_raw, is_male=s_is_male, is_narrator=s_is_narrator, emotion=s_emotion, age_group=seg.get("age_group", "adult"))
                         if os.path.exists(t_raw) and os.path.getsize(t_raw) > 0:
-                            s_seg = AudioSegment.from_file(t_raw)
+                            s_seg = AudioSegment.from_wav(t_raw) if raw_ext == "wav" else AudioSegment.from_file(t_raw)
                             s_dur = len(s_seg) / 1000.0
                             s_target_dur = max(0.1, s_end - s_start)
                             max_user_speed = float(self.settings.get("max_speech_speed", 1.5))
@@ -3287,7 +3568,11 @@ class Dubber:
                     seg_clip = AudioSegment.from_wav(seg_file)
                     sync_offset_ms = float(self.settings.get("audio_sync_offset_ms", 0))
                     pos_ms = max(0, int((s_start * 1000.0) + sync_offset_ms))
-                    dubbed_audio = dubbed_audio.overlay(seg_clip, position=pos_ms)
+                    if "single_placements" not in locals():
+                        single_placements = []
+                    single_placements.append((pos_ms, seg_clip))
+            if "single_placements" in locals() and single_placements:
+                dubbed_audio = fast_overlay_segments(original_duration_ms, single_placements)
             
             # 4. Mixing background stems with dynamic ducking
             self.update_progress(75, "Remixing background track...")
@@ -3328,26 +3613,7 @@ class Dubber:
                         else:
                             merged_intervals.append([s_ms, e_ms])
 
-                for s_ms, e_ms in merged_intervals:
-                    duration = e_ms - s_ms
-                    if duration < 100:
-                        continue
-                    original_chunk = bg_mixed[s_ms:e_ms]
-                    ducked_chunk = original_chunk - duck_db
-                    fade_ms = min(200, int(duration / 2))
-                    if fade_ms > 10:
-                        start_fade = original_chunk[:fade_ms]
-                        start_fade_ducked = ducked_chunk[:fade_ms]
-                        start_transition = start_fade.fade_out(fade_ms).overlay(start_fade_ducked.fade_in(fade_ms))
-                        
-                        end_fade = original_chunk[-fade_ms:]
-                        end_fade_ducked = ducked_chunk[-fade_ms:]
-                        end_transition = end_fade_ducked.fade_out(fade_ms).overlay(end_fade.fade_in(fade_ms))
-                        
-                        mid_section = ducked_chunk[fade_ms:-fade_ms]
-                        bg_mixed = bg_mixed[:s_ms] + start_transition + mid_section + end_transition + bg_mixed[e_ms:]
-                    else:
-                        bg_mixed = bg_mixed[:s_ms] + ducked_chunk + bg_mixed[e_ms:]
+                bg_mixed = fast_duck_audio_segment(bg_mixed, merged_intervals, duck_db)
             
             final_audio = bg_mixed.overlay(dubbed_audio)
             final_audio_path = os.path.join(self.temp_dir, "final_mixed_audio.wav")
@@ -3472,190 +3738,227 @@ class Dubber:
             logger.warning(f"Could not save primary SRT: {psrt_err}")
 
         total_extra = len(target_langs)
-        for lang_idx, lang_code in enumerate(target_langs, 1):
-            lang_label = LANGUAGE_PROMPTS.get(lang_code, lang_code)
-            self.log(f"[YouTube Track {lang_idx}/{total_extra}] Translating dialogue to {lang_label} ({lang_code})...", "info")
-            
-            # Step 1: Translate
-            items_to_translate = []
-            for s in segments:
-                orig_text = s.get("text") or s.get("translation", "")
-                items_to_translate.append({
-                    "id": s.get("id"),
-                    "start": s.get("start"),
-                    "end": s.get("end"),
-                    "text": orig_text,
-                    "gender": s.get("gender", "male"),
-                    "speaker_role": s.get("speaker_role", "lead_actor"),
-                    "emotion": s.get("emotion", "dramatic"),
-                    "age_group": s.get("age_group", "adult")
-                })
-                
-            trans_prompt = f"""
-            You are an expert film and television dubbing dialogue director and translator.
-            Translate the dialogue for each segment into target language: '{lang_label}'.
-            
-            CRITICAL CONSTRAINTS:
-            1. Maintain the exact same segment structure and IDs ({len(items_to_translate)} items).
-            2. The spoken length of your translation MUST fit comfortably within the segment duration ('end' - 'start').
-            3. Keep translated dialogue natural, expressive, and concise so actors can finish speaking naturally.
-            4. Retain the exact "id", "start", "end", "gender", "speaker_role", and "emotion" fields.
-            5. Return ONLY a valid JSON array of objects. Do not include markdown code block syntax.
-            
-            Input Segments:
-            {json.dumps(items_to_translate, ensure_ascii=False, indent=2)}
-            
-            JSON structure:
-            [
-              {{
-                "id": 1,
-                "start": 1.25,
-                "end": 4.5,
-                "text": "original text",
-                "translation": "translated text in {lang_label}",
-                "gender": "male",
-                "speaker_role": "lead_actor",
-                "emotion": "dramatic",
-                "age_group": "adult"
-              }}
-            ]
-            """
-            
-            translated_segments = []
-            try:
-                raw_resp = await self.call_gemini_with_retry(
-                    None,
-                    trans_prompt,
-                    expected_segments=len(items_to_translate)
-                )
-                clean_json_str = extract_json_payload(raw_resp)
-                clean_json_str = re.sub(r',\s*([\]}])', r'\1', clean_json_str)
-                translated_segments = json.loads(clean_json_str, strict=False)
-            except Exception as trans_err:
-                self.log(f"Translation failed for {lang_code}: {trans_err}. Falling back to original segments.", "error")
-                translated_segments = [dict(s) for s in segments]
+        lang_sem = asyncio.Semaphore(3)
 
-            anchor_map = {int(s.get("id", i+1)): s for i, s in enumerate(translated_segments) if isinstance(s, dict)}
-            final_lang_segments = []
-            for idx, orig_seg in enumerate(segments):
-                sid = int(orig_seg.get("id", idx + 1))
-                match = anchor_map.get(sid, {})
-                merged = dict(orig_seg)
-                merged["translation"] = match.get("translation") or orig_seg.get("translation", "")
-                final_lang_segments.append(merged)
-                
-            # Write matching .srt file
-            lang_srt_path = os.path.join(youtube_subs_dir, f"[Dubbed]_{clean_name}_{lang_code}.srt")
-            try:
-                with open(lang_srt_path, "w", encoding="utf-8") as sf:
-                    for s_idx, seg in enumerate(final_lang_segments, 1):
-                        s_t = to_srt_time(float(seg.get("start", 0)))
-                        e_t = to_srt_time(float(seg.get("end", 0)))
-                        txt = str(seg.get("translation", "")).strip()
-                        sf.write(f"{s_idx}\n{s_t} --> {e_t}\n{txt}\n\n")
-            except Exception as srt_err:
-                logger.warning(f"Failed to write SRT for {lang_code}: {srt_err}")
+        # Compact payload: only send {id, start, end, text} to cut input/output tokens by 50%
+        compact_items = []
+        for idx, s in enumerate(segments):
+            orig_text = s.get("text") or s.get("translation", "")
+            compact_items.append({
+                "id": int(s.get("id", idx + 1)),
+                "start": round(float(s.get("start", 0.0)), 2),
+                "end": round(float(s.get("end", 0.0)), 2),
+                "text": orig_text
+            })
 
-            # Step 2: Synthesize TTS
-            self.log(f"[YouTube Track {lang_idx}/{total_extra}] Synthesizing {lang_label} voice acting...", "info")
-            voices_pair = VOICES.get(lang_code, ("en-US-GuyNeural", "en-US-JennyNeural"))
-            male_voice = voices_pair[0]
-            female_voice = voices_pair[1]
-            
-            sem = asyncio.Semaphore(4)
-            extra_temp_dir = os.path.join(self.temp_dir, f"yt_{lang_code}")
-            os.makedirs(extra_temp_dir, exist_ok=True)
-            
-            async def process_extra_seg(idx, seg):
-                text_to_speak = str(seg.get("translation", "")).strip()
-                if not text_to_speak or text_to_speak in ["...", "…", "-", ""]:
-                    return None
+        batch_size = 50
+        item_batches = [compact_items[i:i + batch_size] for i in range(0, len(compact_items), batch_size)]
+
+        async def _process_youtube_language(lang_idx, lang_code):
+            async with lang_sem:
+                lang_label = LANGUAGE_PROMPTS.get(lang_code, lang_code)
+                self.log(f"[YouTube Track {lang_idx}/{total_extra}] Translating dialogue to {lang_label} ({lang_code}) in {len(item_batches)} batch(es)...", "info")
+
+                async def _translate_yt_batch(b_items):
+                    trans_prompt = f"""
+                    You are an expert film and television dubbing dialogue director and translator.
+                    Translate the dialogue for each segment into target language: '{lang_label}'.
                     
-                seg_id = seg.get("id", idx + 1)
-                start = float(seg.get("start", 0))
-                end = float(seg.get("end", 0))
-                
-                is_male = str(seg.get("gender", "male")).lower().strip() == "male"
-                is_female = str(seg.get("gender", "male")).lower().strip() == "female"
-                if self.settings.get("voice_gender") == "male":
-                    chosen_voice = male_voice
-                elif self.settings.get("voice_gender") == "female":
-                    chosen_voice = female_voice
-                else:
-                    chosen_voice = male_voice if (is_male and not is_female) else female_voice
+                    CRITICAL CONSTRAINTS:
+                    1. Maintain the exact same segment structure and IDs ({len(b_items)} items).
+                    2. The spoken length of your translation MUST fit comfortably within the segment duration ('end' - 'start').
+                    3. Keep translated dialogue natural, expressive, and concise so actors can finish speaking naturally.
+                    4. Return ONLY a valid JSON array of objects with "id" and "translation". Do not include markdown code block syntax.
                     
-                temp_tts_file = os.path.join(extra_temp_dir, f"seg_{seg_id}.mp3")
-                temp_stretch_file = os.path.join(extra_temp_dir, f"seg_{seg_id}_str.wav")
-                
-                async with sem:
-                    await self.synthesize_edge_for_lang(text_to_speak, chosen_voice, temp_tts_file)
+                    Input Segments:
+                    {json.dumps(b_items, ensure_ascii=False)}
                     
-                if not os.path.exists(temp_tts_file) or os.path.getsize(temp_tts_file) == 0:
-                    return None
-                    
-                tts_audio = AudioSegment.from_file(temp_tts_file)
-                target_dur = max(0.1, end - start)
-                next_start = original_duration_s
-                if idx + 1 < len(final_lang_segments):
-                    next_start = float(final_lang_segments[idx + 1].get("start", original_duration_s))
-                max_allowed = max(target_dur, next_start - start - 0.15)
-                
-                tts_dur = len(tts_audio) / 1000.0
-                if tts_dur <= max_allowed:
-                    speed = 1.0
-                else:
-                    speed = min(1.45, tts_dur / max_allowed)
-                    
-                if abs(speed - 1.0) < 0.05:
-                    final_audio_seg = tts_audio
-                else:
+                    JSON structure:
+                    [
+                      {{
+                        "id": {b_items[0]["id"]},
+                        "translation": "translated text in {lang_label}"
+                      }}
+                    ]
+                    """
+                    raw_resp = await self.call_gemini_with_retry(
+                        None,
+                        trans_prompt,
+                        expected_segments=len(b_items)
+                    )
+                    clean_json_str = extract_json_payload(raw_resp)
+                    clean_json_str = re.sub(r',\s*([\]}])', r'\1', clean_json_str)
                     try:
-                        await self.async_time_stretch_audio(temp_tts_file, temp_stretch_file, speed)
-                        final_audio_seg = AudioSegment.from_wav(temp_stretch_file)
+                        parsed = json.loads(clean_json_str, strict=False)
                     except Exception:
-                        final_audio_seg = tts_audio
-                        
-                max_limit = max_allowed + 0.30
-                if (len(final_audio_seg) / 1000.0) > max_limit:
-                    cut_ms = int(max_limit * 1000.0)
-                    fade_ms = min(150, int(cut_ms * 0.1))
-                    final_audio_seg = final_audio_seg[:cut_ms].fade_out(duration=fade_ms)
-                    
-                return (start, final_audio_seg)
+                        last_brace = clean_json_str.rfind('}')
+                        if last_brace != -1 and clean_json_str.find('[') != -1:
+                            repaired = clean_json_str[clean_json_str.find('['):last_brace + 1]
+                            repaired = re.sub(r',\s*$', '', repaired) + "\n]"
+                            parsed = json.loads(repaired, strict=False)
+                        else:
+                            parsed = []
+                    return parsed if isinstance(parsed, list) else []
 
-            tts_tasks = [process_extra_seg(i, s) for i, s in enumerate(final_lang_segments)]
-            tts_results = await asyncio.gather(*tts_tasks, return_exceptions=True)
-            
-            extra_dubbed_audio = AudioSegment.silent(duration=original_duration_ms)
-            for res in tts_results:
-                if res and not isinstance(res, Exception):
-                    start_sec, seg_audio = res
-                    sync_offset_ms = float(self.settings.get("audio_sync_offset_ms", 0))
-                    target_ms = max(0, int((start_sec * 1000.0) + sync_offset_ms))
-                    extra_dubbed_audio = extra_dubbed_audio.overlay(seg_audio, position=target_ms)
-                    
-            # Step 3: Mix with BGM stem and export .m4a directly (zero video re-encoding)
-            extra_full_mix = bg_mixed.overlay(extra_dubbed_audio)
-            temp_mix_wav = os.path.join(extra_temp_dir, f"mix_{lang_code}.wav")
-            extra_full_mix.export(temp_mix_wav, format="wav")
-            
-            output_m4a_path = os.path.join(youtube_tracks_dir, f"[Dubbed]_{clean_name}_{lang_code}.m4a")
-            m4a_cmd = [
-                get_ffmpeg_cmd(), "-y",
-                "-i", temp_mix_wav,
-                "-c:a", "aac",
-                "-b:a", "384k",
-                "-ar", "48000",
-                output_m4a_path
-            ]
-            await self.async_run_cmd(m4a_cmd, f"YouTube Audio Stem ({lang_code})")
-            self.log(f"[SUCCESS] YouTube stem exported: YouTube_Audio_Tracks\\[Dubbed]_{clean_name}_{lang_code}.m4a", "success")
+                translated_segments = []
+                try:
+                    batch_tasks = [_translate_yt_batch(b) for b in item_batches]
+                    batch_lists = await asyncio.gather(*batch_tasks, return_exceptions=True)
+                    for b_res in batch_lists:
+                        if isinstance(b_res, list):
+                            translated_segments.extend(b_res)
+                except Exception as trans_err:
+                    self.log(f"Translation failed for {lang_code}: {trans_err}. Falling back to original segments.", "error")
+                    translated_segments = [dict(s) for s in segments]
+
+                anchor_map = {int(s.get("id", i + 1)): s for i, s in enumerate(translated_segments) if isinstance(s, dict)}
+                final_lang_segments = []
+                for idx, orig_seg in enumerate(segments):
+                    sid = int(orig_seg.get("id", idx + 1))
+                    match = anchor_map.get(sid, {})
+                    merged = dict(orig_seg)
+                    merged["translation"] = match.get("translation") or orig_seg.get("translation", "")
+                    final_lang_segments.append(merged)
+
+                # Write matching .srt file
+                lang_srt_path = os.path.join(youtube_subs_dir, f"[Dubbed]_{clean_name}_{lang_code}.srt")
+                try:
+                    with open(lang_srt_path, "w", encoding="utf-8") as sf:
+                        for s_idx, seg in enumerate(final_lang_segments, 1):
+                            s_t = to_srt_time(float(seg.get("start", 0)))
+                            e_t = to_srt_time(float(seg.get("end", 0)))
+                            txt = str(seg.get("translation", "")).strip()
+                            sf.write(f"{s_idx}\n{s_t} --> {e_t}\n{txt}\n\n")
+                except Exception as srt_err:
+                    logger.warning(f"Failed to write SRT for {lang_code}: {srt_err}")
+
+                # Step 2: Synthesize TTS
+                self.log(f"[YouTube Track {lang_idx}/{total_extra}] Synthesizing {lang_label} voice acting...", "info")
+                voices_pair = VOICES.get(lang_code, ("en-US-GuyNeural", "en-US-JennyNeural"))
+                male_voice = voices_pair[0]
+                female_voice = voices_pair[1]
+
+                sem = asyncio.Semaphore(6)
+                extra_temp_dir = os.path.join(self.temp_dir, f"yt_{lang_code}")
+                os.makedirs(extra_temp_dir, exist_ok=True)
+
+                max_user_speed = float(self.settings.get("max_speech_speed", 1.5))
+                max_fit_speed = max(1.45, max_user_speed if max_user_speed > 1.05 else 1.45)
+
+                async def process_extra_seg(idx, seg):
+                    raw_text = str(seg.get("translation", ""))
+                    text_to_speak = re.sub(r"\[.*?\]", "", raw_text)
+                    text_to_speak = re.sub(r"\(.*?\)", "", text_to_speak).strip()
+                    text_to_speak = text_to_speak.lstrip(":-; ").strip()
+                    text_to_speak = re.sub(r'(.+?[\?\!\.\,\s]+)\1+', r'\1', text_to_speak).strip()
+                    if not text_to_speak and raw_text:
+                        fallback_text = re.sub(r"^[\[\(（\s]+|[\]\)）\s]+$", "", raw_text).strip()
+                        if fallback_text:
+                            text_to_speak = fallback_text
+                    if not text_to_speak or text_to_speak in ["...", "…", "-", ""]:
+                        return None
+
+                    seg_id = seg.get("id", idx + 1)
+                    start = float(seg.get("start", 0))
+                    end = float(seg.get("end", 0))
+
+                    gender_str = str(seg.get("gender", "male")).lower().strip()
+                    is_female = "female" in gender_str or "woman" in gender_str or "girl" in gender_str
+                    is_male = ("male" in gender_str and not is_female) or "man" in gender_str or "boy" in gender_str
+                    if self.settings.get("voice_gender") == "male":
+                        chosen_voice = male_voice
+                    elif self.settings.get("voice_gender") == "female":
+                        chosen_voice = female_voice
+                    else:
+                        chosen_voice = male_voice if (is_male and not is_female) else female_voice
+
+                    target_dur = max(0.1, end - start)
+                    next_start = original_duration_s
+                    if idx + 1 < len(final_lang_segments):
+                        next_start = float(final_lang_segments[idx + 1].get("start", original_duration_s))
+                    max_allowed = max(target_dur, next_start - start - 0.15)
+
+                    # Estimate speaking rate upfront for tight windows to minimize secondary FFmpeg stretches
+                    est_chars_per_sec = 14.0 if lang_code in ("en-US", "en-GB", "de-DE", "fr-FR", "es-ES", "nl-NL", "it-IT", "pt-BR", "vi-VN", "id-ID", "fil-PH") else 8.5
+                    est_dur = len(text_to_speak) / est_chars_per_sec
+                    pre_rate = 1.0
+                    if est_dur > max_allowed * 1.08:
+                        pre_rate = min(1.30, max(1.0, est_dur / max_allowed))
+
+                    temp_tts_file = os.path.join(extra_temp_dir, f"seg_{seg_id}.mp3")
+                    temp_stretch_file = os.path.join(extra_temp_dir, f"seg_{seg_id}_str.wav")
+
+                    async with sem:
+                        await self.synthesize_edge_for_lang(text_to_speak, chosen_voice, temp_tts_file, speed_ratio=pre_rate)
+
+                    if not os.path.exists(temp_tts_file) or os.path.getsize(temp_tts_file) == 0:
+                        return None
+
+                    tts_audio = AudioSegment.from_file(temp_tts_file)
+                    tts_dur = len(tts_audio) / 1000.0
+                    if tts_dur <= max_allowed:
+                        speed = 1.0
+                    else:
+                        speed = min(max_fit_speed, tts_dur / max_allowed)
+
+                    if abs(speed - 1.0) < 0.05:
+                        final_audio_seg = tts_audio
+                    else:
+                        try:
+                            await self.async_time_stretch_audio(temp_tts_file, temp_stretch_file, speed)
+                            final_audio_seg = AudioSegment.from_wav(temp_stretch_file)
+                        except Exception:
+                            final_audio_seg = tts_audio
+
+                    emotion = str(seg.get("emotion", "dramatic")).lower().strip()
+                    if emotion == "whisper" or "whisper" in emotion:
+                        final_audio_seg = final_audio_seg + 12
+
+                    max_limit = max_allowed + 0.30
+                    if (len(final_audio_seg) / 1000.0) > max_limit:
+                        cut_ms = int(max_limit * 1000.0)
+                        fade_ms = min(150, int(cut_ms * 0.1))
+                        final_audio_seg = final_audio_seg[:cut_ms].fade_out(duration=fade_ms)
+
+                    return (start, final_audio_seg)
+
+                tts_tasks = [process_extra_seg(i, s) for i, s in enumerate(final_lang_segments)]
+                tts_results = await asyncio.gather(*tts_tasks, return_exceptions=True)
+
+                extra_placements = []
+                for res in tts_results:
+                    if res and not isinstance(res, Exception):
+                        start_sec, seg_audio = res
+                        sync_offset_ms = float(self.settings.get("audio_sync_offset_ms", 0))
+                        target_ms = max(0, int((start_sec * 1000.0) + sync_offset_ms))
+                        extra_placements.append((target_ms, seg_audio))
+                extra_dubbed_audio = fast_overlay_segments(original_duration_ms, extra_placements)
+
+                # Step 3: Mix with BGM stem and export .m4a directly (zero video re-encoding)
+                extra_full_mix = bg_mixed.overlay(extra_dubbed_audio)
+                temp_mix_wav = os.path.join(extra_temp_dir, f"mix_{lang_code}.wav")
+                extra_full_mix.export(temp_mix_wav, format="wav")
+
+                output_m4a_path = os.path.join(youtube_tracks_dir, f"[Dubbed]_{clean_name}_{lang_code}.m4a")
+                m4a_cmd = [
+                    get_ffmpeg_cmd(), "-y",
+                    "-i", temp_mix_wav,
+                    "-c:a", "aac",
+                    "-b:a", "384k",
+                    "-ar", "48000",
+                    output_m4a_path
+                ]
+                await self.async_run_cmd(m4a_cmd, f"YouTube Audio Stem ({lang_code})")
+                self.log(f"[SUCCESS] YouTube stem exported: YouTube_Audio_Tracks\\[Dubbed]_{clean_name}_{lang_code}.m4a", "success")
+
+        lang_tasks = [_process_youtube_language(idx, l_code) for idx, l_code in enumerate(target_langs, 1)]
+        await asyncio.gather(*lang_tasks, return_exceptions=True)
 
 # Sync runtime version into frozen __main__ (AutoDubber.exe) so hot-patches update the UI version badge
 try:
     _main_mod = sys.modules.get("__main__")
     if _main_mod is not None and hasattr(_main_mod, "APP_VERSION"):
-        _main_mod.APP_VERSION = "2.2.0"
+        _main_mod.APP_VERSION = "2.2.1"
 except Exception:
     pass
 
