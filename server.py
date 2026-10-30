@@ -1331,7 +1331,7 @@ async def re_dub_video_endpoint(video_id: str):
     return {"status": "success"}
 
 # --- Universal Dual-Channel Auto-Updater Endpoints ---
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 
 @app.get("/api/system/version")
 async def get_system_version():

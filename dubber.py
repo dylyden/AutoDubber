@@ -367,48 +367,118 @@ def extract_json_payload(text: str) -> str:
             
     return text
 
+import hashlib
+import time
+from dataclasses import dataclass, field
+
+@dataclass
+class KeyHealth:
+    raw_key: str
+    clean_key: str
+    masked_key: str
+    key_type: str
+    cooldown_until: float = 0.0
+    in_use: int = 0
+    uploaded_files: dict = field(default_factory=dict)  # file_hash -> uploaded_file_obj
+
+    def is_available(self) -> bool:
+        return time.monotonic() >= self.cooldown_until
+
+
 class ApiKeyPool:
     def __init__(self):
         self.keys = []
         self.leased_keys = {}  # key -> count of tasks currently using it
+        self.health_map = {}   # clean_key -> KeyHealth
         self.lock = asyncio.Lock()
 
     def set_keys(self, keys):
-        self.keys = keys
-        # Clean up leased_keys for keys that are no longer in settings
-        for key in list(self.leased_keys.keys()):
-            if key not in keys:
-                del self.leased_keys[key]
+        self.keys = list(keys) if keys else []
+        active_clean = set()
+        for k in self.keys:
+            info = identify_key_format(k)
+            clean = info["key"] if info["key"] else str(k).strip()
+            if clean:
+                active_clean.add(clean)
+                if clean not in self.health_map:
+                    self.health_map[clean] = KeyHealth(
+                        raw_key=k,
+                        clean_key=clean,
+                        masked_key=info.get("masked", "***"),
+                        key_type=info.get("type", "unknown")
+                    )
+                else:
+                    self.health_map[clean].raw_key = k
 
-    async def acquire_key(self, failed_keys=None):
-        """
-        Acquires an API key from the pool.
-        If failed_keys is provided (set of keys that failed during current run),
-        we prioritize other keys by sorting failed keys last.
-        """
+        for key in list(self.leased_keys.keys()):
+            if key not in self.keys:
+                del self.leased_keys[key]
+        for clean_k in list(self.health_map.keys()):
+            if clean_k not in active_clean:
+                del self.health_map[clean_k]
+
+    @staticmethod
+    def compute_file_hash(path: str) -> str:
+        if not path or not os.path.exists(path):
+            return ""
+        st = os.stat(path)
+        raw = f"{os.path.abspath(path)}:{st.st_size}:{st.st_mtime_ns}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    async def acquire_router_key(self, preferred_file_hash: str = "", failed_keys=None) -> KeyHealth:
         async with self.lock:
             if not self.keys:
                 raise ValueError("No Gemini API keys provided. Please load keys in the API Manager.")
-            
-            candidates = self.keys.copy()
-            
-            # Sort candidates by:
-            # 1. Has it failed in the current run? (failed_keys is a set)
-            # 2. How many tasks are currently using it? (Prefer fewer)
-            def key_priority(k):
-                in_use_count = self.leased_keys.get(k, 0)
-                is_failed = (failed_keys is not None and k in failed_keys)
-                return (is_failed, in_use_count)
-            
-            candidates.sort(key=key_priority)
-            best_key = candidates[0]
-            
-            # Increment lease count
-            self.leased_keys[best_key] = self.leased_keys.get(best_key, 0) + 1
-            return best_key
+            if not self.health_map:
+                self.set_keys(self.keys)
 
-    async def release_key(self, key):
+            gemini_candidates = [
+                kh for kh in self.health_map.values()
+                if kh.key_type in ("gemini_new_aq", "gemini_legacy_aiza", "unknown")
+            ]
+            if not gemini_candidates:
+                gemini_candidates = list(self.health_map.values())
+
+            now = time.monotonic()
+            available = [kh for kh in gemini_candidates if kh.cooldown_until <= now]
+            if not available:
+                soonest = min(gemini_candidates, key=lambda x: x.cooldown_until)
+                wait_s = max(0.5, min(15.0, soonest.cooldown_until - now))
+                await asyncio.sleep(wait_s)
+                available = [soonest]
+
+            def router_priority(kh: KeyHealth):
+                is_failed = 1 if (failed_keys and (kh.raw_key in failed_keys or kh.clean_key in failed_keys)) else 0
+                has_cached = 0 if (preferred_file_hash and preferred_file_hash in kh.uploaded_files) else 1
+                return (is_failed, has_cached, kh.in_use)
+
+            available.sort(key=router_priority)
+            chosen = available[0]
+            chosen.in_use += 1
+            self.leased_keys[chosen.raw_key] = chosen.in_use
+            return chosen
+
+    async def release_router_key(self, kh: KeyHealth, rate_limited: bool = False, cooldown_seconds: float = 60.0):
         async with self.lock:
+            kh.in_use = max(0, kh.in_use - 1)
+            if kh.raw_key in self.leased_keys:
+                self.leased_keys[kh.raw_key] = kh.in_use
+            if rate_limited:
+                kh.cooldown_until = time.monotonic() + cooldown_seconds
+
+    async def acquire_key(self, failed_keys=None):
+        kh = await self.acquire_router_key(failed_keys=failed_keys)
+        return kh.raw_key
+
+    async def release_key(self, key, rate_limited: bool = False):
+        async with self.lock:
+            info = identify_key_format(key)
+            clean = info["key"] if info["key"] else str(key).strip()
+            if clean in self.health_map:
+                kh = self.health_map[clean]
+                kh.in_use = max(0, kh.in_use - 1)
+                if rate_limited:
+                    kh.cooldown_until = time.monotonic() + 60.0
             if key in self.leased_keys:
                 self.leased_keys[key] = max(0, self.leased_keys[key] - 1)
 
@@ -1004,13 +1074,63 @@ class Dubber:
 
         raise RuntimeError(f"All Groq API models and keys failed. Last error: {last_error}")
 
-    async def call_gemini_with_retry(self, audio_file_path, prompt, reference_audios=None):
-        """Uploads audio to Gemini and requests JSON response with key rotation on rate limits."""
-        # Groq Cloud API path (Free LPU)
-        if self.settings.get("api_type") == "groq":
-            return await self.call_groq_with_retry(prompt, audio_file_path)
+    def classify_router_task(self, audio_file_path, prompt: str) -> str:
+        """
+        Classifies task modality and tier for the Hybrid Gemini Router:
+        - 'bulk_translate': Text-only translation (e.g., YouTube extra language tracks)
+        - 'story_recap': Text-only narrative storytelling (Movie Recap Mode with Whisper transcript)
+        - 'multimodal_dub': Acoustic voice pitch/gender/emotion analysis + dialogue translation
+        """
+        if not audio_file_path or not os.path.exists(str(audio_file_path)):
+            return "bulk_translate"
+        if "Input Segments:" in prompt and "Maintain the exact same segment structure" in prompt:
+            return "bulk_translate"
+        if self.settings.get("movie_recap_mode", False) and "Here is the raw dialogue spoken in the video:" in prompt:
+            return "story_recap"
+        return "multimodal_dub"
 
-        # Vertex AI path
+    async def cleanup_router_files(self):
+        """Deletes any cached Gemini File API uploads across all keys in the pool at the end of a video."""
+        loop = asyncio.get_event_loop()
+        import google.generativeai.client as client_mod  # type: ignore
+        from google.api_core.client_options import ClientOptions  # type: ignore
+
+        for kh in list(api_key_pool.health_map.values()):
+            if not kh.uploaded_files:
+                continue
+            try:
+                client_options = ClientOptions(api_key=kh.clean_key)
+                file_client = client_mod.FileServiceClient(client_options=client_options)
+                for f_hash, f_obj in list(kh.uploaded_files.items()):
+                    try:
+                        await loop.run_in_executor(None, lambda name=f_obj.name: file_client.delete_file(name=name))
+                    except Exception:
+                        pass
+                    kh.uploaded_files.pop(f_hash, None)
+            except Exception:
+                kh.uploaded_files.clear()
+
+    async def call_gemini_with_retry(self, audio_file_path, prompt, reference_audios=None, expected_segments=None):
+        """
+        Hybrid Type-3 (Task/Modality) + Type-4 (Multi-Key/Provider Failover) Gemini Router.
+        Routes requests dynamically across multimodal vs text-only tiers, reuses uploaded
+        File API handles across batches on the same key, and enforces a 60s rate-limit circuit breaker.
+        """
+        task_mode = self.classify_router_task(audio_file_path, prompt)
+        need_audio = (task_mode == "multimodal_dub" and audio_file_path and os.path.exists(str(audio_file_path)))
+
+        # 1. Explicit Groq Cloud API path OR oportunistic Groq offload for bulk text translation
+        pool_keys = api_key_pool.keys if api_key_pool.keys else self.api_keys
+        has_groq_key = any(str(k).strip().strip('"\'').startswith("gsk_") for k in (pool_keys or [])) or bool(self.settings.get("groq_api_key", "").strip())
+        if self.settings.get("api_type") == "groq" or (task_mode == "bulk_translate" and has_groq_key and self.settings.get("api_type") != "vertex"):
+            try:
+                return await self.call_groq_with_retry(prompt, audio_file_path)
+            except Exception as groq_err:
+                if self.settings.get("api_type") == "groq":
+                    raise groq_err
+                self.log(f"Router Groq offload failed ({groq_err}), routing to Gemini Flash-Lite...", "warning")
+
+        # 2. Vertex AI path (Modality-Aware)
         if self.settings.get("api_type") == "vertex":
             creds_file, project_id = self.find_gcp_credentials()
             if not creds_file:
@@ -1030,32 +1150,36 @@ class Dubber:
                 scopes=["https://www.googleapis.com/auth/cloud-platform"]
             )
             
-            # Compress audio if file size exceeds 10MB to save bandwidth and upload in 1-2 seconds
+            audio_bytes = None
             audio_mime_type = "audio/wav"
-            target_audio_path = audio_file_path
-            file_size = os.path.getsize(target_audio_path)
-            if file_size > 10 * 1024 * 1024 and str(audio_file_path).lower().endswith(".wav"):
-                temp_mp3 = os.path.join(self.temp_dir, "vertex_inline_compressed.mp3")
-                self.log(f"Compressing vocals ({file_size / (1024*1024):.1f} MB) to mono 96k MP3 for rapid Vertex AI upload...", "info")
-                cmd = [get_ffmpeg_cmd(), "-y", "-i", target_audio_path, "-ac", "1", "-b:a", "96k", temp_mp3]
-                await self.async_run_cmd(cmd, "Audio Compression for Vertex AI")
-                if os.path.exists(temp_mp3) and os.path.getsize(temp_mp3) > 0:
-                    target_audio_path = temp_mp3
-                    audio_mime_type = "audio/mp3"
+            if need_audio:
+                target_audio_path = audio_file_path
+                file_size = os.path.getsize(target_audio_path)
+                if file_size > 10 * 1024 * 1024 and str(audio_file_path).lower().endswith(".wav"):
+                    temp_mp3 = os.path.join(self.temp_dir, "vertex_inline_compressed.mp3")
+                    if not os.path.exists(temp_mp3) or os.path.getsize(temp_mp3) == 0:
+                        self.log(f"Compressing vocals ({file_size / (1024*1024):.1f} MB) to mono 96k MP3 for rapid Vertex AI upload...", "info")
+                        cmd = [get_ffmpeg_cmd(), "-y", "-i", target_audio_path, "-ac", "1", "-b:a", "96k", temp_mp3]
+                        await self.async_run_cmd(cmd, "Audio Compression for Vertex AI")
+                    if os.path.exists(temp_mp3) and os.path.getsize(temp_mp3) > 0:
+                        target_audio_path = temp_mp3
+                        audio_mime_type = "audio/mp3"
 
-            with open(target_audio_path, "rb") as f:
-                audio_bytes = f.read()
+                with open(target_audio_path, "rb") as f:
+                    audio_bytes = f.read()
                 
-            model_priorities = [
-                "gemini-3.6-flash",
-                "gemini-3.6-pro",
-                "gemini-2.5-flash",
-                "gemini-2.5-pro",
-                "gemini-1.5-flash-002",
-                "gemini-1.5-pro-002",
-                "gemini-1.5-flash",
-                "gemini-1.5-pro"
-            ]
+            if task_mode == "bulk_translate":
+                model_priorities = ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-3.6-flash"]
+            elif task_mode == "story_recap":
+                model_priorities = ["gemini-2.5-pro", "gemini-3.6-pro", "gemini-2.5-flash", "gemini-3.6-flash"]
+            else:
+                model_priorities = [
+                    "gemini-2.5-flash",
+                    "gemini-3.6-flash",
+                    "gemini-2.5-pro",
+                    "gemini-3.6-pro",
+                    "gemini-1.5-flash-002"
+                ]
             server_regions = [
                 "global",
                 "us-central1",
@@ -1063,7 +1187,6 @@ class Dubber:
                 "asia-east1"
             ]
             
-            # Enforce structured OpenAPI schema response (either single transcript metadata or timeline array of segments)
             is_timeline = "JSON structure" in prompt or "Split the transcription" in prompt
             
             if is_timeline:
@@ -1099,7 +1222,7 @@ class Dubber:
                 
             for model in model_priorities:
                 for region in server_regions:
-                    self.log(f"Attempting Vertex AI generation (Failover Matrix). Model: {model} | Region: {region}...", "info")
+                    self.log(f"Gemini Router [{task_mode}] -> Vertex AI {model} ({region})...", "info")
                     try:
                         client = google_genai.Client(
                             vertexai=True,
@@ -1111,17 +1234,18 @@ class Dubber:
                         loop = asyncio.get_event_loop()
                         def do_vertex_generate():
                             contents = []
-                            if reference_audios:
-                                contents.append(f"I am providing {len(reference_audios)} reference audio clips for established character voices:")
-                                for role_key, path in reference_audios.items():
-                                    if os.path.exists(path):
-                                        with open(path, "rb") as f:
-                                            ref_bytes = f.read()
-                                        contents.append(f"Reference Audio for role: {role_key}")
-                                        contents.append(types.Part.from_bytes(data=ref_bytes, mime_type="audio/wav"))
-                            
-                            contents.append("Here is the main audio you need to transcribe and translate:")
-                            contents.append(types.Part.from_bytes(data=audio_bytes, mime_type=audio_mime_type))
+                            if need_audio and audio_bytes:
+                                if reference_audios:
+                                    contents.append(f"I am providing {len(reference_audios)} reference audio clips for established character voices:")
+                                    for role_key, path in reference_audios.items():
+                                        if os.path.exists(path):
+                                            with open(path, "rb") as f:
+                                                ref_bytes = f.read()
+                                            contents.append(f"Reference Audio for role: {role_key}")
+                                            contents.append(types.Part.from_bytes(data=ref_bytes, mime_type="audio/wav"))
+                                
+                                contents.append("Here is the main audio you need to transcribe and translate:")
+                                contents.append(types.Part.from_bytes(data=audio_bytes, mime_type=audio_mime_type))
                             contents.append(prompt)
                             
                             return client.models.generate_content(
@@ -1133,7 +1257,6 @@ class Dubber:
                                 )
                             )
                             
-                        # Wrap with timeout
                         response = await asyncio.wait_for(
                             loop.run_in_executor(None, do_vertex_generate),
                             timeout=600.0
@@ -1153,9 +1276,9 @@ class Dubber:
                         self.log(f"Vertex AI failover: unexpected error on {model} ({region}): {other_err}", "warning")
                         await asyncio.sleep(2)
                         
-            self.log("Vertex AI failover exhausted: All model/region combinations failed. Falling back to Legacy AI Studio API...", "warning")
+            self.log("Vertex AI failover exhausted: All model/region combinations failed. Falling back to AI Studio Router...", "warning")
 
-        # Legacy AI Studio path below
+        # 3. Hybrid AI Studio Gemini Router Path (Sticky File Cache + Task Tiering + 60s Circuit Breaker)
         import google.generativeai.client as client_mod  # type: ignore
         import google.ai.generativelanguage as glm  # type: ignore
         from google.api_core.client_options import ClientOptions  # type: ignore
@@ -1163,95 +1286,105 @@ class Dubber:
         import pathlib
 
         loop = asyncio.get_event_loop()
-        current_leased_key = None
-        failed_keys = set()
-        pool_keys = api_key_pool.keys if api_key_pool.keys else self.api_keys
-        max_attempts = max(len(pool_keys) * 2 + 1, 5) if pool_keys else 3
-        
-        target_model = self.settings.get("model", "gemini-2.5-flash")
-        model_candidates = [target_model]
-        for fallback in ["gemini-2.5-flash", "gemini-3.6-flash", "gemini-3.5-flash"]:
-            if fallback not in model_candidates:
-                model_candidates.append(fallback)
-        
-        for attempt in range(max_attempts):
-            try:
-                # Release previous key if any
-                if current_leased_key:
-                    await api_key_pool.release_key(current_leased_key)
-                    failed_keys.add(current_leased_key)
-                    current_leased_key = None
-                
-                # Acquire a key from the global pool, avoiding keys that already failed.
-                current_leased_key = await api_key_pool.acquire_key(failed_keys)
-                
-                key_info = identify_key_format(current_leased_key)
-                key_to_use = key_info["key"] if key_info["key"] else current_leased_key.strip()
-                
-                # Log which key we are using (masked)
-                self.log(f"Using API key: {key_info['masked']} (In-use count: {api_key_pool.leased_keys.get(current_leased_key, 0)})", "info")
-                
-                # Initialize local clients configured specifically with the leased key
-                client_options = ClientOptions(api_key=key_to_use)
-                generative_client = glm.GenerativeServiceClient(client_options=client_options)
-                file_client = client_mod.FileServiceClient(client_options=client_options)
-                
-                upload_target_path = audio_file_path
-                file_sz = os.path.getsize(upload_target_path)
-                mime_type = "audio/wav"
-                if file_sz > 15 * 1024 * 1024 and str(audio_file_path).lower().endswith(".wav"):
-                    compressed_mp3 = os.path.join(self.temp_dir, "gemini_upload_compressed.mp3")
+        if self.api_keys and not api_key_pool.keys:
+            api_key_pool.set_keys(self.api_keys)
+
+        # Prepare compressed upload target once if audio is required
+        upload_target_path = None
+        mime_type = "audio/wav"
+        preferred_hash = ""
+        if need_audio:
+            upload_target_path = audio_file_path
+            file_sz = os.path.getsize(upload_target_path)
+            if file_sz > 10 * 1024 * 1024 and str(audio_file_path).lower().endswith(".wav"):
+                compressed_mp3 = os.path.join(self.temp_dir, "gemini_upload_compressed.mp3")
+                if not os.path.exists(compressed_mp3) or os.path.getsize(compressed_mp3) == 0:
                     self.log(f"Compressing vocals ({file_sz / (1024*1024):.1f} MB) to 128k MP3 for faster upload...", "info")
                     compress_cmd = [get_ffmpeg_cmd(), "-y", "-i", audio_file_path, "-b:a", "128k", compressed_mp3]
                     await self.async_run_cmd(compress_cmd, "Audio Compression for Gemini Upload")
-                    if os.path.exists(compressed_mp3) and os.path.getsize(compressed_mp3) > 0:
-                        upload_target_path = compressed_mp3
-                        mime_type = "audio/mp3"
-                
-                path = pathlib.Path(os.fspath(upload_target_path))
-                display_name = path.name
-                self.log(f"Uploading isolated vocals to Gemini API (Size: {os.path.getsize(upload_target_path)/(1024*1024):.2f} MB)...", "info")
-                
+                if os.path.exists(compressed_mp3) and os.path.getsize(compressed_mp3) > 0:
+                    upload_target_path = compressed_mp3
+                    mime_type = "audio/mp3"
+            preferred_hash = api_key_pool.compute_file_hash(upload_target_path)
+
+        # Build model route tier based on task classification
+        user_model = self.settings.get("model", "gemini-2.5-flash")
+        if task_mode == "bulk_translate":
+            model_candidates = ["gemini-2.5-flash-lite", "gemini-2.0-flash-lite", "gemini-2.5-flash", user_model]
+        elif task_mode == "story_recap":
+            model_candidates = ["gemini-2.5-pro", user_model, "gemini-2.5-flash", "gemini-3.5-flash"]
+        else:
+            model_candidates = [user_model, "gemini-2.5-flash", "gemini-2.5-pro", "gemini-3.6-flash", "gemini-3.5-flash"]
+        # Deduplicate while preserving order
+        seen_m = set()
+        model_candidates = [m for m in model_candidates if m and not (m in seen_m or seen_m.add(m))]
+
+        failed_keys = set()
+        pool_size = max(len(api_key_pool.keys), 1)
+        max_attempts = max(pool_size * 2 + 1, 5)
+
+        for attempt in range(max_attempts):
+            kh = None
+            rate_limited = False
+            try:
+                kh = await api_key_pool.acquire_router_key(preferred_file_hash=preferred_hash, failed_keys=failed_keys)
+                self.log(
+                    f"Gemini Router [{task_mode}] leased key {kh.masked_key} (In-use: {kh.in_use}, Cached files: {len(kh.uploaded_files)})",
+                    "info"
+                )
+
+                client_options = ClientOptions(api_key=kh.clean_key)
+                generative_client = glm.GenerativeServiceClient(client_options=client_options)
+                file_client = client_mod.FileServiceClient(client_options=client_options)
+
+                async def get_or_upload_file(local_path: str, m_type: str):
+                    f_hash = api_key_pool.compute_file_hash(local_path)
+                    if f_hash and f_hash in kh.uploaded_files:
+                        self.log(f"Router cache hit: Reusing uploaded {os.path.basename(local_path)} on key {kh.masked_key} (0 upload cost).", "info")
+                        return kh.uploaded_files[f_hash]
+
+                    p_obj = pathlib.Path(os.fspath(local_path))
+                    self.log(f"Uploading {p_obj.name} ({os.path.getsize(local_path)/(1024*1024):.2f} MB) to Gemini File API...", "info")
+                    def _create():
+                        resp = file_client.create_file(
+                            path=p_obj, mime_type=m_type, name=None, display_name=p_obj.name, resumable=True
+                        )
+                        return file_types.File(resp)
+                    up_file = await loop.run_in_executor(None, _create)
+                    while getattr(up_file, "state", None) and up_file.state.name == "PROCESSING":
+                        await asyncio.sleep(1)
+                        up_file = await loop.run_in_executor(None, lambda: file_client.get_file(name=up_file.name))
+                    if getattr(up_file, "state", None) and up_file.state.name == "FAILED":
+                        raise RuntimeError(f"Uploaded audio {p_obj.name} failed processing in Gemini storage.")
+                    if f_hash:
+                        kh.uploaded_files[f_hash] = up_file
+                    return up_file
+
                 uploaded_refs = []
-                if reference_audios:
-                    for role_key, ref_path in reference_audios.items():
-                        if os.path.exists(ref_path):
-                            def upload_ref(rp=ref_path):
-                                p = pathlib.Path(rp)
-                                return file_client.create_file(path=p, mime_type="audio/wav", name=None, display_name=p.name, resumable=True)
-                            try:
-                                ref_file_resp = await loop.run_in_executor(None, upload_ref)
-                                uploaded_refs.append((role_key, file_types.File(ref_file_resp)))
-                            except Exception as e:
-                                self.log(f"Failed to upload reference audio {ref_path}: {e}", "warning")
-                
-                def do_upload():
-                    response = file_client.create_file(
-                        path=path, mime_type=mime_type, name=None, display_name=display_name, resumable=True
-                    )
-                    return file_types.File(response)
+                uploaded_file = None
+                if need_audio and upload_target_path:
+                    if reference_audios:
+                        for role_key, ref_path in reference_audios.items():
+                            if os.path.exists(ref_path):
+                                try:
+                                    ref_f = await get_or_upload_file(ref_path, "audio/wav")
+                                    uploaded_refs.append((role_key, ref_f))
+                                except Exception as ref_err:
+                                    self.log(f"Failed to upload reference audio {ref_path}: {ref_err}", "warning")
+                    uploaded_file = await get_or_upload_file(upload_target_path, mime_type)
+                else:
+                    self.log(f"Router [{task_mode}]: Skipping audio upload (text-only fast path).", "info")
 
-                uploaded_file = await loop.run_in_executor(None, do_upload)
-
-                # Wait if file is still processing
-                while getattr(uploaded_file, "state", None) and uploaded_file.state.name == "PROCESSING":
-                    await asyncio.sleep(1)
-                    uploaded_file = await loop.run_in_executor(None, lambda: file_client.get_file(name=uploaded_file.name))
-
-                if getattr(uploaded_file, "state", None) and uploaded_file.state.name == "FAILED":
-                    raise RuntimeError("Uploaded audio file processing failed in Gemini storage.")
-
-                self.log(f"File uploaded. Processing transcription & translation with model {target_model}...", "info")
-                
                 def do_generate():
                     generate_contents = []
-                    if uploaded_refs:
-                        generate_contents.append(f"I am providing {len(uploaded_refs)} reference audio clips for established character voices:")
-                        for r_key, r_file in uploaded_refs:
-                            generate_contents.append(f"Reference Audio for role: {r_key}")
-                            generate_contents.append(r_file)
-                    generate_contents.append("Here is the main audio you need to transcribe and translate:")
-                    generate_contents.append(uploaded_file)
+                    if uploaded_file is not None:
+                        if uploaded_refs:
+                            generate_contents.append(f"I am providing {len(uploaded_refs)} reference audio clips for established character voices:")
+                            for r_key, r_file in uploaded_refs:
+                                generate_contents.append(f"Reference Audio for role: {r_key}")
+                                generate_contents.append(r_file)
+                        generate_contents.append("Here is the main audio you need to transcribe and translate:")
+                        generate_contents.append(uploaded_file)
                     generate_contents.append(prompt)
 
                     last_gen_err = None
@@ -1259,59 +1392,52 @@ class Dubber:
                         try:
                             m_inst = genai.GenerativeModel(m_candidate)
                             m_inst._client = generative_client
-                            return m_inst.generate_content(
+                            resp = m_inst.generate_content(
                                 generate_contents,
                                 generation_config={"response_mime_type": "application/json"}
                             )
+                            text_out = resp.text or ""
+                            if expected_segments and text_out.count('"id"') < int(expected_segments * 0.75):
+                                raise ValueError(f"Model {m_candidate} returned incomplete segment count (<75% of {expected_segments}).")
+                            return resp, m_candidate
                         except Exception as m_err:
                             last_gen_err = m_err
-                            if "404" in str(m_err) or "not found" in str(m_err).lower():
+                            err_s = str(m_err).lower()
+                            if "404" in err_s or "not found" in err_s or "incomplete segment count" in err_s:
                                 continue
                             raise m_err
                     if last_gen_err:
                         raise last_gen_err
 
-                # Wrap with asyncio.wait_for to prevent infinite hanging on network/Google backend drops
-                response = await asyncio.wait_for(
+                response, used_model = await asyncio.wait_for(
                     loop.run_in_executor(None, do_generate),
-                    timeout=90.0
+                    timeout=120.0
                 )
 
-                
-                # Replicate delete using local file_client
-                try:
-                    def do_delete():
-                        file_client.delete_file(name=uploaded_file.name)
-                        for _, ref_file in uploaded_refs:
-                            try:
-                                file_client.delete_file(name=ref_file.name)
-                            except:
-                                pass
-                    await loop.run_in_executor(None, do_delete)
-                except Exception as de:
-                    logger.warning(f"Failed to delete uploaded file from Gemini storage: {de}")
-                
                 text_response = response.text
-                
-                # Release key on success
-                await api_key_pool.release_key(current_leased_key)
+                self.log(f"Router [{task_mode}] completed via {used_model} on key {kh.masked_key}.", "success")
+                await api_key_pool.release_router_key(kh, rate_limited=False)
                 return text_response
-                
+
             except Exception as e:
-                masked_key = identify_key_format(current_leased_key)["masked"] if current_leased_key else "Unknown"
-                self.log(f"Gemini API error with Key {masked_key}: {str(e)}", "warning")
-                
-                # Wait before retry
+                err_str = str(e)
+                if "429" in err_str or "quota" in err_str.lower() or "resourceexhausted" in err_str.lower():
+                    rate_limited = True
+                if kh is not None:
+                    failed_keys.add(kh.raw_key)
+                    await api_key_pool.release_router_key(kh, rate_limited=rate_limited, cooldown_seconds=60.0)
+                    kh = None
+
+                masked = identify_key_format(list(failed_keys)[-1])["masked"] if failed_keys else "Unknown"
+                status_tag = "429 Rate-Limited (60s cooldown)" if rate_limited else "Error"
+                self.log(f"Router failover on Key {masked} [{status_tag}]: {err_str}", "warning")
+
                 if attempt < max_attempts - 1:
-                    wait_time = 10 if len(api_key_pool.keys) <= 1 else 2
-                    self.log(f"Retrying translation attempt {attempt + 2}/{max_attempts} in {wait_time}s...", "warning")
+                    wait_time = 6 if len(api_key_pool.keys) <= 1 else 1.5
+                    self.log(f"Router switching key/tier (attempt {attempt + 2}/{max_attempts}) in {wait_time}s...", "warning")
                     await asyncio.sleep(wait_time)
-        
-        # Ensure we release the key if we failed completely
-        if current_leased_key:
-            await api_key_pool.release_key(current_leased_key)
-            
-        raise RuntimeError("Failed to translate: All Gemini API keys failed or rate-limited.")
+
+        raise RuntimeError("Failed to translate: All Gemini API keys and router tiers exhausted.")
 
     async def process_video(self, video_path, video_id):
         """Main processing pipeline for a single video."""
@@ -1672,10 +1798,10 @@ class Dubber:
             raw_response = ""
 
             try:
-                if whisper_segments_list and not movie_recap_mode and len(whisper_segments_list) > 25:
-                    batch_size = 25
+                if whisper_segments_list and not movie_recap_mode and len(whisper_segments_list) > 45:
+                    batch_size = 45
                     batches = [whisper_segments_list[i:i + batch_size] for i in range(0, len(whisper_segments_list), batch_size)]
-                    self.log(f"Whisper transcript has {len(whisper_segments_list)} segments. Processing in {len(batches)} batches of ~{batch_size} to avoid AI output token limits...", "info")
+                    self.log(f"Whisper transcript has {len(whisper_segments_list)} segments. Processing in {len(batches)} batches of ~{batch_size} via cached File API handle...", "info")
                     
                     segments = []
                     for b_idx, batch_segs in enumerate(batches, 1):
@@ -1716,7 +1842,12 @@ class Dubber:
                             b_prompt += f"\n\nCRITICAL SPEAKER LOCKING: Match character voices against reference audios."
                         
                         async with get_gemini_lock():
-                            b_raw = await self.call_gemini_with_retry(vocals_wav, b_prompt, reference_audios=recap_refs)
+                            b_raw = await self.call_gemini_with_retry(
+                                vocals_wav,
+                                b_prompt,
+                                reference_audios=recap_refs,
+                                expected_segments=len(batch_segs)
+                            )
                         raw_response += f"\n--- BATCH {b_idx} ---\n" + b_raw
                         
                         b_clean = extract_json_payload(b_raw)
@@ -1756,8 +1887,14 @@ class Dubber:
                         prompt += f"\n\nCRITICAL SPEAKER LOCKING: I have provided {len(locked_speaker_roles)} reference audio files representing established character voices in this video series. You MUST compare the speakers in the MAIN audio against these references. If a voice in the MAIN audio matches a reference voice, you MUST assign the EXACT SAME 'speaker_role' (e.g. 'lead_actor', 'narrator') as the reference. Do not create new roles for voices that match. IMPORTANT: DO NOT transcribe the reference audios! ONLY transcribe the MAIN audio."
                     
                     recap_refs = None if movie_recap_mode else locked_speaker_roles
+                    expected_cnt = len(whisper_segments_list) if (whisper_segments_list and not movie_recap_mode) else None
                     async with get_gemini_lock():
-                        raw_response = await self.call_gemini_with_retry(vocals_wav, prompt, reference_audios=recap_refs)
+                        raw_response = await self.call_gemini_with_retry(
+                            vocals_wav,
+                            prompt,
+                            reference_audios=recap_refs,
+                            expected_segments=expected_cnt
+                        )
                     
                     # Clean JSON response from markdown blocks if present
                     clean_json = extract_json_payload(raw_response)
@@ -2439,7 +2576,11 @@ class Dubber:
             self.log(f"[ERROR] Failed to process video {filename}: {str(e)}", "error")
             raise e
         finally:
-            # Clean up temp folder to save space
+            # Clean up cached Gemini File API uploads and local temp folder
+            try:
+                await self.cleanup_router_files()
+            except Exception:
+                pass
             try:
                 if self.temp_dir and os.path.exists(self.temp_dir):
                     # We keep logs but delete heavy wav stems
@@ -3382,7 +3523,11 @@ class Dubber:
             
             translated_segments = []
             try:
-                raw_resp = await self.call_gemini_with_retry(vocals_wav, trans_prompt)
+                raw_resp = await self.call_gemini_with_retry(
+                    None,
+                    trans_prompt,
+                    expected_segments=len(items_to_translate)
+                )
                 clean_json_str = extract_json_payload(raw_resp)
                 clean_json_str = re.sub(r',\s*([\]}])', r'\1', clean_json_str)
                 translated_segments = json.loads(clean_json_str, strict=False)
