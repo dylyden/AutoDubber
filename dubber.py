@@ -3958,7 +3958,7 @@ class Dubber:
 try:
     _main_mod = sys.modules.get("__main__")
     if _main_mod is not None and hasattr(_main_mod, "APP_VERSION"):
-        _main_mod.APP_VERSION = "2.2.3"
+        _main_mod.APP_VERSION = "2.2.4"
 except Exception:
     pass
 

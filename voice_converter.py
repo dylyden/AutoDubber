@@ -630,13 +630,19 @@ class VoxCPM4GBEngine:
             return
 
         int8_path = build_or_get_int8_safetensors(model_dir)
-        for req_meta in ("config.json", "audiovae.pth", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"):
+        for req_meta in ("config.json", "audiovae.pth", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "tokenization_voxcpm2.py"):
             if not os.path.exists(os.path.join(model_dir, req_meta)):
                 try:
                     from huggingface_hub import hf_hub_download
+                    print(f"[VoxCPM2-4GB] Fetching missing {req_meta} from openbmb/VoxCPM2...")
                     hf_hub_download(repo_id="openbmb/VoxCPM2", filename=req_meta, local_dir=model_dir)
                 except Exception:
-                    pass
+                    try:
+                        import urllib.request
+                        url = f"https://huggingface.co/openbmb/VoxCPM2/resolve/main/{req_meta}"
+                        urllib.request.urlretrieve(url, os.path.join(model_dir, req_meta))
+                    except Exception:
+                        pass
         with open(os.path.join(model_dir, "config.json"), "r", encoding="utf-8") as f:
             config = VoxCPMConfig.model_validate_json(f.read())
 
