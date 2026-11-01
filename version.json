@@ -1,0 +1,7 @@
+{
+  "version": "2.2.6",
+  "manifest_url": "https://raw.githubusercontent.com/dylyden/AutoDubber/main/version.json",
+  "download_url": "https://github.com/dylyden/AutoDubber/archive/refs/heads/main.zip",
+  "updated_at": "2026-11-01 15:54:26",
+  "changelog": "Bug fixes and extractor updates"
+}

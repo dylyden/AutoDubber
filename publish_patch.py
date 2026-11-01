@@ -1,110 +1,111 @@
 """
 Automated Patch Publisher for AutoDubber
-Usage:
-    python publish_patch.py 2.1.1 "Fixed audio sync and edge-tts handshake"
+Called by Publish_Update.bat
 """
 
 import os
 import sys
 import json
 import zipfile
-import subprocess
 import re
-
-def _get_current_and_next_version(server_py_path: str):
-    curr_ver = "2.2.0"
-    if os.path.exists(server_py_path):
-        try:
-            with open(server_py_path, "r", encoding="utf-8") as f:
-                m = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', f.read())
-                if m:
-                    curr_ver = m.group(1).lstrip("vV")
-        except Exception:
-            pass
-    parts = [int(x) if x.isdigit() else 0 for x in curr_ver.split(".")]
-    while len(parts) < 3:
-        parts.append(0)
-    parts[-1] += 1
-    return curr_ver, ".".join(str(x) for x in parts)
-
+import time
 
 def main():
     root_dir = os.path.dirname(os.path.abspath(__file__))
+    version_json_path = os.path.join(root_dir, "version.json")
     server_py = os.path.join(root_dir, "server.py")
-    curr_ver, suggested_ver = _get_current_and_next_version(server_py)
-
-    if len(sys.argv) < 2:
-        print(f"Current Version : v{curr_ver}")
-        print(f"Suggested Next  : v{suggested_ver}\n")
-        try:
-            u_ver = input(f"Enter new version [Press ENTER for {suggested_ver}]: ").strip().lstrip("vV")
-            new_version = u_ver if u_ver else suggested_ver
-            u_notes = input("Enter release notes [Press ENTER for default]: ").strip()
-            notes = u_notes if u_notes else f"Release v{new_version}: Speed & Voice Engine Update"
-        except EOFError:
-            new_version = suggested_ver
-            notes = f"Release v{new_version}: Speed & Voice Engine Update"
-        print(f"\n[AUTO] Publishing v{new_version}...")
-    else:
-        new_version = sys.argv[1].lstrip("vV")
-        notes = sys.argv[2] if len(sys.argv) >= 3 else f"Release v{new_version}"
-
-    # 1. Bump APP_VERSION in server.py and dubber.py
-    if os.path.exists(server_py):
-        with open(server_py, "r", encoding="utf-8") as f:
-            content = f.read()
-        updated_content = re.sub(r'APP_VERSION\s*=\s*["\'].*?["\']', f'APP_VERSION = "{new_version}"', content)
-        with open(server_py, "w", encoding="utf-8") as f:
-            f.write(updated_content)
-        print(f"[OK] Bumped APP_VERSION to {new_version} in server.py")
-
     dubber_py = os.path.join(root_dir, "dubber.py")
+
+    # 1. Load or determine current version
+    current_ver = "2.2.5"
+    manifest_data = {
+        "version": current_ver,
+        "manifest_url": "https://raw.githubusercontent.com/dylyden/AutoDubber/main/version.json",
+        "download_url": "https://github.com/dylyden/AutoDubber/archive/refs/heads/main.zip",
+        "updated_at": "",
+        "changelog": "Bug fixes and performance updates"
+    }
+
+    if os.path.exists(version_json_path):
+        try:
+            with open(version_json_path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                if isinstance(saved, dict):
+                    manifest_data.update(saved)
+                    current_ver = str(saved.get("version", current_ver)).lstrip("vV")
+        except Exception:
+            pass
+    elif os.path.exists(server_py):
+        try:
+            with open(server_py, "r", encoding="utf-8") as f:
+                m = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', f.read())
+                if m:
+                    current_ver = m.group(1).lstrip("vV")
+        except Exception:
+            pass
+
+    # Read CLI args from Publish_Update.bat
+    raw_ver = sys.argv[1].strip().lstrip("vV") if len(sys.argv) >= 2 else ""
+    changelog = sys.argv[2].strip() if len(sys.argv) >= 3 else ""
+
+    target_ver = raw_ver if raw_ver else current_ver
+    changelog = changelog if changelog else manifest_data.get("changelog", "Bug fixes and performance updates")
+
+    # Update version.json
+    manifest_data["version"] = target_ver
+    manifest_data["changelog"] = changelog
+    manifest_data["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    with open(version_json_path, "w", encoding="utf-8") as f:
+        json.dump(manifest_data, f, indent=2)
+    print(f"Updated version.json -> v{target_ver}")
+
+    # 2. Update server.py and dubber.py APP_VERSION
+    if os.path.exists(server_py):
+        try:
+            with open(server_py, "r", encoding="utf-8") as f:
+                s_content = f.read()
+            s_updated = re.sub(r'APP_VERSION\s*=\s*["\'].*?["\']', f'APP_VERSION = "{target_ver}"', s_content)
+            with open(server_py, "w", encoding="utf-8") as f:
+                f.write(s_updated)
+        except Exception as e:
+            print(f"Warning updating server.py: {e}")
+
     if os.path.exists(dubber_py):
-        with open(dubber_py, "r", encoding="utf-8") as f:
-            d_content = f.read()
-        d_updated = re.sub(r'_main_mod\.APP_VERSION\s*=\s*["\'].*?["\']', f'_main_mod.APP_VERSION = "{new_version}"', d_content)
-        with open(dubber_py, "w", encoding="utf-8") as f:
-            f.write(d_updated)
-        print(f"[OK] Bumped _main_mod.APP_VERSION to {new_version} in dubber.py")
+        try:
+            with open(dubber_py, "r", encoding="utf-8") as f:
+                d_content = f.read()
+            d_updated = re.sub(r'_main_mod\.APP_VERSION\s*=\s*["\'].*?["\']', f'_main_mod.APP_VERSION = "{target_ver}"', d_content)
+            with open(dubber_py, "w", encoding="utf-8") as f:
+                f.write(d_updated)
+        except Exception as e:
+            print(f"Warning updating dubber.py: {e}")
 
-    # 2. Build lightweight patch.zip
-    patch_zip_name = "patch.zip"
-    patch_zip_path = os.path.join(root_dir, patch_zip_name)
-    files_to_pack = ["dubber.py", "voice_converter.py", "server.py", "app.js", "index.html", "style.css"]
-    
-    with zipfile.ZipFile(patch_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for fname in files_to_pack:
-            fpath = os.path.join(root_dir, fname)
-            if os.path.exists(fpath):
-                zf.write(fpath, fname)
-                print(f"[PACKED] {fname} ({os.path.getsize(fpath) / 1024:.1f} KB)")
+    # 3. Rebuild app.zip
+    app_zip_path = os.path.join(root_dir, "app.zip")
+    core_files = [
+        "server.py",
+        "dubber.py",
+        "voice_converter.py",
+        "dialog_picker.py",
+        "run_voxcpm_studio.py",
+        "vertex_batch_processor.py",
+        "system_diagnostic.py",
+        "app.js",
+        "index.html",
+        "style.css",
+        "version.json"
+    ]
 
-    print(f"[OK] Generated {patch_zip_name} ({os.path.getsize(patch_zip_path) / 1024:.1f} KB total)")
-
-    # 3. Git commit & tag
-    tag_name = f"v{new_version}"
     try:
-        subprocess.run(["git", "add", "."], check=True)
-        subprocess.run(["git", "commit", "-m", f"Release {tag_name}: {notes}"], check=False)
-        subprocess.run(["git", "tag", "-a", tag_name, "-m", notes], check=False)
-        print(f"[OK] Created Git tag {tag_name}")
-        
-        # Check if remote exists
-        res = subprocess.run(["git", "remote"], capture_output=True, text=True)
-        if "origin" in res.stdout:
-            print(f"[PUSHING] Pushing commit and tag {tag_name} to GitHub...")
-            subprocess.run(["git", "push", "origin", "main", "--tags"], check=False)
-            subprocess.run(["git", "push", "origin", "master", "--tags"], check=False)
-            print("[SUCCESS] Pushed to GitHub successfully!")
-        else:
-            print("[INFO] No remote 'origin' configured yet. Run 'git remote add origin <url>' to connect.")
+        with zipfile.ZipFile(app_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fname in core_files:
+                fpath = os.path.join(root_dir, fname)
+                if os.path.exists(fpath):
+                    zf.write(fpath, fname)
+        print("Rebuilt app.zip successfully")
     except Exception as e:
-        print(f"[WARN] Git step encountered: {e}")
-
-    print("\n=======================================================")
-    print(f"PATCH READY: {patch_zip_path}")
-    print(f"Attach {patch_zip_name} to your GitHub Release for {tag_name}.")
-    print("=======================================================")
+        print(f"Warning rebuilding app.zip: {e}")
 
 if __name__ == "__main__":
     main()
