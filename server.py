@@ -57,9 +57,12 @@ def get_subtitles_dir():
     return target
 
 import json
+import copy
 import uuid
 import asyncio
 import logging
+import threading
+import time
 import subprocess
 import warnings
 
@@ -149,6 +152,7 @@ is_processing: bool = False
 active_task_ids: set = set()
 active_tasks: dict = {}
 thread_pool = ThreadPoolExecutor(max_workers=4)
+main_loop: Any = None
 
 SETTINGS_FILE = os.path.join(get_base_path(), "settings.json")
 QUEUE_FILE = os.path.join(get_base_path(), "queue.json")
@@ -158,6 +162,15 @@ if os.path.exists(QUEUE_FILE):
     try:
         with open(QUEUE_FILE, "r") as f:
             queue = json.load(f)
+            for item in queue:
+                if "job_id" not in item:
+                    item["job_id"] = "job_default"
+                if "job_name" not in item:
+                    item["job_name"] = "General Batch"
+                if "config" not in item:
+                    item["config"] = dict(default_settings)
+                if "config_locked" not in item:
+                    item["config_locked"] = True if item.get("status") in ["Completed", "Processing"] else False
     except Exception as e:
         logger.error(f"Error loading queue: {e}")
 
@@ -281,13 +294,14 @@ def broadcast_sync(message: Dict[str, Any]):
 def schedule_task(coro):
     try:
         loop = asyncio.get_running_loop()
-        if loop is main_loop:
+        if loop is not None:
             loop.create_task(coro)
             return
     except RuntimeError:
         pass
     try:
-        asyncio.run_coroutine_threadsafe(coro, main_loop)
+        if main_loop is not None and getattr(main_loop, 'is_running', lambda: False)():
+            asyncio.run_coroutine_threadsafe(coro, main_loop)
     except Exception as e:
         logger.error(f"Failed to schedule task: {e}")
 
@@ -342,49 +356,156 @@ class DroppedFile(BaseModel):
     name: str
     size: int
     path: Optional[str] = ""
+    relative_path: Optional[str] = ""
 
 class AddDroppedRequest(BaseModel):
     files: List[DroppedFile]
+    job_name: Optional[str] = None
+
+def get_explorer_paths() -> List[str]:
+    paths = []
+    if os.name != 'nt':
+        return paths
+    try:
+        import win32com.client
+        shell = win32com.client.Dispatch("Shell.Application")
+        for w in shell.Windows():
+            try:
+                if hasattr(w, 'Document') and w.Document:
+                    try:
+                        items = w.Document.SelectedItems()
+                        for i in range(items.Count):
+                            p = items.Item(i).Path
+                            if p and os.path.exists(p):
+                                paths.append(p)
+                    except Exception:
+                        pass
+                    if hasattr(w.Document, 'Folder') and w.Document.Folder:
+                        p = w.Document.Folder.Self.Path
+                        if p and os.path.exists(p):
+                            paths.append(p)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return list(dict.fromkeys(paths))
+
+def resolve_dropped_file(f: DroppedFile, job_name: str = "") -> str:
+    if getattr(f, 'path', "") and os.path.exists(f.path):
+        return os.path.abspath(f.path)
+
+    filename = f.name
+    rel_clean = (getattr(f, 'relative_path', "") or "").replace("\\", "/").strip("/ ")
+
+    user_home = os.path.expanduser("~")
+    base_dirs = [
+        os.path.join(user_home, "Desktop"),
+        os.path.join(user_home, "Downloads"),
+        os.path.join(user_home, "Videos"),
+        os.getcwd(),
+        os.path.dirname(os.getcwd()),
+        os.path.join(user_home, "Documents"),
+    ]
+
+    custom_out = settings.get("custom_output_path", "")
+    if custom_out and os.path.exists(custom_out):
+        base_dirs.append(custom_out)
+
+    explorer_paths = get_explorer_paths()
+    all_bases = []
+    for ep in explorer_paths:
+        if os.path.isdir(ep) and ep not in all_bases:
+            all_bases.append(ep)
+        elif os.path.isfile(ep):
+            if os.path.basename(ep) == filename:
+                return os.path.abspath(ep)
+            d = os.path.dirname(ep)
+            if d not in all_bases:
+                all_bases.append(d)
+
+    for b in base_dirs:
+        if b and os.path.exists(b) and b not in all_bases:
+            all_bases.append(b)
+
+    for b in all_bases:
+        if rel_clean:
+            p_rel = os.path.join(b, rel_clean.replace("/", os.sep))
+            if os.path.isfile(p_rel):
+                return os.path.abspath(p_rel)
+            parts = rel_clean.split("/")
+            if len(parts) > 1:
+                p_sub = os.path.join(b, *parts[1:])
+                if os.path.isfile(p_sub):
+                    return os.path.abspath(p_sub)
+
+        if job_name:
+            p_job = os.path.join(b, job_name, filename)
+            if os.path.isfile(p_job):
+                return os.path.abspath(p_job)
+
+        p_flat = os.path.join(b, filename)
+        if os.path.isfile(p_flat):
+            return os.path.abspath(p_flat)
+
+    for root_dir in all_bases[:12]:
+        try:
+            if job_name:
+                job_dir = os.path.join(root_dir, job_name)
+                if os.path.isdir(job_dir):
+                    p = os.path.join(job_dir, filename)
+                    if os.path.isfile(p):
+                        return os.path.abspath(p)
+            with os.scandir(root_dir) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        p = os.path.join(entry.path, filename)
+                        if os.path.isfile(p):
+                            return os.path.abspath(p)
+        except (PermissionError, OSError):
+            continue
+
+    return ""
 
 @app.post("/api/queue/add-dropped")
 async def add_dropped(req: AddDroppedRequest):
-    # Try to resolve path locally on server side (Desktop, Downloads, or Workspace)
-    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-    downloads = os.path.join(os.path.expanduser("~"), "Downloads")
-    workspace = os.getcwd()
-    
     sorted_files = sorted(req.files, key=lambda f: natural_sort_key(f.name))
+    job_id = str(uuid.uuid4())
+    job_name = (req.job_name or "").strip()
+
+    resolved_items = []
+    unresolved_names = []
     for f in sorted_files:
-        resolved_path = ""
-        
-        if getattr(f, 'path', "") and os.path.exists(f.path):
-            resolved_path = f.path
-        else:
-            # 1. Check workspace
-            p_work = os.path.join(workspace, f.name)
-            # 2. Check desktop
-            p_desk = os.path.join(desktop, f.name)
-            # 3. Check downloads
-            p_down = os.path.join(downloads, f.name)
-            
-            if os.path.exists(p_work):
-                resolved_path = p_work
-            elif os.path.exists(p_desk):
-                resolved_path = p_desk
-            elif os.path.exists(p_down):
-                resolved_path = p_down
-            
+        resolved_path = resolve_dropped_file(f, job_name)
         if resolved_path:
-            queue.append({
-                "id": str(uuid.uuid4()),
-                "name": f.name,
-                "path": resolved_path,
-                "progress": 0,
-                "status": "Queued"
-            })
-            send_log(f"Resolved dropped file path: {resolved_path}", "success")
+            resolved_items.append((f.name, resolved_path))
+            send_log(f"Resolved dropped file: {resolved_path}", "success")
         else:
-            send_log(f"[WARNING] Could not resolve full path for dropped file '{f.name}'. Please add it using '+ Add Files' instead.", "warning")
+            unresolved_names.append(f.name)
+
+    if unresolved_names:
+        send_log(f"[WARNING] Could not resolve path for {len(unresolved_names)} file(s) ({', '.join(unresolved_names[:3])}{'...' if len(unresolved_names) > 3 else ''}). Use '+ Add Files' or '+ Add Folder' to select directly.", "warning")
+
+    if not job_name:
+        if resolved_items:
+            first_dir = os.path.dirname(resolved_items[0][1])
+            job_name = os.path.basename(first_dir) if first_dir else f"Job ({len(resolved_items)} EPs)"
+        else:
+            job_name = f"Job ({len(sorted_files)} EPs)"
+
+    current_snap = copy.deepcopy(settings)
+    for name, path in resolved_items:
+        queue.append({
+            "id": str(uuid.uuid4()),
+            "job_id": job_id,
+            "job_name": job_name,
+            "name": name,
+            "path": path,
+            "progress": 0,
+            "status": "Not Started",
+            "config": copy.deepcopy(current_snap),
+            "config_locked": False,
+            "created_at": time.time()
+        })
             
     await broadcast({"type": "queue_update", "queue": queue})
     save_queue_to_disk()
@@ -478,6 +599,82 @@ async def clear_all():
     save_queue_to_disk()
     return {"queue": queue}
 
+@app.delete("/api/queue/job/{job_id}")
+async def delete_queue_job(job_id: str):
+    global queue
+    try:
+        import shutil
+        subtitles_dir = get_subtitles_dir()
+        job_items = [item for item in queue if item.get("job_id") == job_id]
+        for item in job_items:
+            video_id = item["id"]
+            subtitles_json_path = os.path.join(subtitles_dir, f"{video_id}.json")
+            seg_preview_dir = os.path.join(subtitles_dir, str(video_id))
+            if os.path.exists(subtitles_json_path):
+                try: os.remove(subtitles_json_path)
+                except Exception: pass
+            if os.path.exists(seg_preview_dir):
+                shutil.rmtree(seg_preview_dir, ignore_errors=True)
+    except Exception as cleanup_err:
+        logger.error(f"Failed to cleanup files for job_id {job_id}: {cleanup_err}")
+
+    queue = [item for item in queue if item.get("job_id") != job_id]
+    await broadcast({"type": "queue_update", "queue": queue})
+    save_queue_to_disk()
+    return {"queue": queue}
+
+@app.post("/api/queue/job/retry/{job_id}")
+async def retry_job_errors(job_id: str):
+    for item in queue:
+        if item.get("job_id") == job_id:
+            if item["status"] not in ["Queued", "Completed"]:
+                if item["id"] not in active_task_ids:
+                    item["status"] = "Queued"
+                    item["progress"] = 0
+    await broadcast({"type": "queue_update", "queue": queue})
+    save_queue_to_disk()
+    return {"queue": queue}
+
+@app.post("/api/queue/job/remove-completed/{job_id}")
+async def remove_job_completed(job_id: str):
+    global queue
+    completed_items = [item for item in queue if item.get("job_id") == job_id and item["status"] == "Completed"]
+    try:
+        import shutil
+        subtitles_dir = get_subtitles_dir()
+        for item in completed_items:
+            video_id = item["id"]
+            subtitles_json_path = os.path.join(subtitles_dir, f"{video_id}.json")
+            seg_preview_dir = os.path.join(subtitles_dir, str(video_id))
+            if os.path.exists(subtitles_json_path):
+                try: os.remove(subtitles_json_path)
+                except Exception: pass
+            if os.path.exists(seg_preview_dir):
+                shutil.rmtree(seg_preview_dir, ignore_errors=True)
+    except Exception as cleanup_err:
+        logger.error(f"Failed to cleanup completed files for job {job_id}: {cleanup_err}")
+
+    queue = [item for item in queue if not (item.get("job_id") == job_id and item["status"] == "Completed")]
+    await broadcast({"type": "queue_update", "queue": queue})
+    save_queue_to_disk()
+    return {"queue": queue}
+
+class RenameJobRequest(BaseModel):
+    job_id: str
+    job_name: str
+
+@app.post("/api/queue/job/rename")
+async def rename_job(req: RenameJobRequest):
+    new_name = req.job_name.strip()
+    if new_name:
+        for item in queue:
+            if item.get("job_id") == req.job_id:
+                item["job_name"] = new_name
+        await broadcast({"type": "queue_update", "queue": queue})
+        save_queue_to_disk()
+    return {"queue": queue}
+
+
 # File Explorer Browsing
 def run_file_dialog(browse_type: str):
     # Execute in an isolated subprocess to prevent Tkinter 'main thread is not in main loop' crash
@@ -565,17 +762,32 @@ async def browse_path(type: str):
     added_count = 0
     if type == "files":
         selected_sorted = sorted(selected, key=lambda x: natural_sort_key(os.path.basename(x)))
+        job_id = str(uuid.uuid4())
+        first_dir = os.path.dirname(selected_sorted[0]) if selected_sorted else ""
+        job_name = os.path.basename(first_dir) if first_dir else f"Job ({len(selected_sorted)} EPs)"
+        if not job_name:
+            job_name = f"Job ({len(selected_sorted)} EPs)"
+
+        current_snap = copy.deepcopy(settings)
         for filepath in selected_sorted:
             if filepath not in [item["path"] for item in queue]:
                 queue.append({
                     "id": str(uuid.uuid4()),
+                    "job_id": job_id,
+                    "job_name": job_name,
                     "name": os.path.basename(filepath),
                     "path": filepath,
                     "progress": 0,
-                    "status": "Queued"
+                    "status": "Not Started",
+                    "config": copy.deepcopy(current_snap),
+                    "config_locked": False,
+                    "created_at": time.time()
                 })
                 added_count += 1
     elif type == "folder":
+        job_id = str(uuid.uuid4())
+        job_name = os.path.basename(os.path.normpath(selected)) or "Folder Job"
+        current_snap = copy.deepcopy(settings)
         for root, dirs, files in os.walk(selected):
             files_sorted = sorted(files, key=natural_sort_key)
             for file in files_sorted:
@@ -584,10 +796,15 @@ async def browse_path(type: str):
                     if filepath not in [item["path"] for item in queue]:
                         queue.append({
                             "id": str(uuid.uuid4()),
+                            "job_id": job_id,
+                            "job_name": job_name,
                             "name": file,
                             "path": filepath,
                             "progress": 0,
-                            "status": "Queued"
+                            "status": "Not Started",
+                            "config": copy.deepcopy(current_snap),
+                            "config_locked": False,
+                            "created_at": time.time()
                         })
                         added_count += 1
                         
@@ -799,9 +1016,22 @@ async def get_settings():
 
 @app.post("/api/settings")
 async def save_settings(req: Dict[str, Any]):
-    global settings
+    global settings, queue
     settings.update(req)
     save_settings_to_disk()
+
+    # Synchronize current active settings into any unlocked queued items
+    unlocked_modified = False
+    current_snap = copy.deepcopy(settings)
+    for item in queue:
+        if item.get("status") == "Queued" and not item.get("config_locked", False):
+            item["config"] = copy.deepcopy(current_snap)
+            unlocked_modified = True
+
+    if unlocked_modified:
+        save_queue_to_disk()
+        await broadcast({"type": "queue_update", "queue": queue})
+
     return {"status": "success"}
 
 @app.post("/api/settings/keys")
@@ -837,7 +1067,11 @@ async def run_pipeline_for_video(video):
         })
         schedule_task(coro)
 
-    dubber = Dubber(settings, api_keys, log_cb, prog_cb)
+    video_config = video.get("config")
+    effective_settings = dict(settings)
+    if isinstance(video_config, dict) and video_config:
+        effective_settings.update(video_config)
+    dubber = Dubber(effective_settings, api_keys, log_cb, prog_cb)
     
     # Path guard
     if not video["path"] or not os.path.exists(video["path"]):
@@ -893,6 +1127,10 @@ async def queue_worker():
             for i in range(min(slots_available, len(queued_items))):
                 item = queued_items[i]
                 item["status"] = "Processing"
+                if not item.get("config_locked"):
+                    if "config" not in item or not item["config"]:
+                        item["config"] = copy.deepcopy(settings)
+                    item["config_locked"] = True
                 # Start task
                 task = asyncio.create_task(run_pipeline_for_video(item))
                 active_tasks[item["id"]] = task
@@ -941,18 +1179,42 @@ async def activate_license(req: Dict[str, str] = {}):
 
 @app.post("/api/process/start")
 async def start_processing():
-    global is_processing, processing_task
+    global is_processing, processing_task, queue
 
+    # 1. Lock all unlocked items with current settings snapshot and transition to Queued
+    locked_count = 0
+    current_snap = copy.deepcopy(settings)
+    for item in queue:
+        if not item.get("config_locked", False):
+            item["config"] = copy.deepcopy(current_snap)
+            item["config_locked"] = True
+            if item.get("status") in ["Not Started", "Pending"]:
+                item["status"] = "Queued"
+            locked_count += 1
+        elif item.get("status") in ["Not Started", "Pending"]:
+            item["status"] = "Queued"
+            locked_count += 1
+
+    if locked_count > 0:
+        save_queue_to_disk()
+        await broadcast({"type": "queue_update", "queue": queue})
+
+    # 2. If already running, notify and let active worker continue
     if is_processing:
-        return {"status": "error", "message": "Already processing."}
-        
+        lang = settings.get("target_lang", "km-KH")
+        send_log(f"Queued new jobs with current settings ({lang}). Processing continues in active worker.", "success")
+        return {"status": "success", "message": "Queue updated and running."}
+
+    # 3. Not currently running - start fresh or resume
     is_processing = True
-    # Reset completed/error items to queued if we start fresh
     for item in queue:
         if item["status"] in ["Error", "Cancelled"]:
             item["status"] = "Queued"
             item["progress"] = 0
-            
+            if not item.get("config_locked"):
+                item["config"] = copy.deepcopy(current_snap)
+                item["config_locked"] = True
+
     processing_task = asyncio.create_task(queue_worker())
     await broadcast({"type": "status_update", "is_processing": True})
     return {"status": "success"}
@@ -1331,7 +1593,7 @@ async def re_dub_video_endpoint(video_id: str):
     return {"status": "success"}
 
 # --- Universal Dual-Channel Auto-Updater Endpoints ---
-APP_VERSION = "2.2.5"
+APP_VERSION = "2.2.6"
 
 def get_runtime_app_version() -> str:
     """Reads active version from disk (server.py or version.txt) so hot-patches update immediately without exe rebuild."""

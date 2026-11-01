@@ -843,7 +843,12 @@ class Dubber:
                 global global_whisper_model
                 if global_whisper_model is None:
                     model_base = get_base_path()
-                    model_path = os.path.join(model_base, "models", "faster-whisper-large-v3-turbo")
+                    if getattr(sys, 'frozen', False):
+                        exe_models = os.path.join(os.path.dirname(sys.executable), "models")
+                        if os.path.exists(exe_models):
+                            model_base = os.path.dirname(sys.executable)
+                    local_m = os.path.join(model_base, "models", "faster-whisper-large-v3-turbo")
+                    model_path = local_m if os.path.exists(local_m) else "deepdml/faster-whisper-large-v3-turbo-ct2"
                     global_whisper_model = WhisperModel(model_path, device="cpu", compute_type="int8")
                 segs, _ = global_whisper_model.transcribe(audio_path, language="en")
                 return " ".join([s.text for s in segs]).strip()
@@ -1753,7 +1758,8 @@ class Dubber:
                             if os.path.exists(exe_models):
                                 model_base = os.path.dirname(sys.executable)
                                 
-                        model_path = os.path.join(model_base, "models", "faster-whisper-large-v3-turbo")
+                        local_m = os.path.join(model_base, "models", "faster-whisper-large-v3-turbo")
+                        model_path = local_m if os.path.exists(local_m) else "deepdml/faster-whisper-large-v3-turbo-ct2"
                     
 
                         loop = asyncio.get_event_loop()
@@ -3955,7 +3961,7 @@ class Dubber:
 try:
     _main_mod = sys.modules.get("__main__")
     if _main_mod is not None and hasattr(_main_mod, "APP_VERSION"):
-        _main_mod.APP_VERSION = "2.2.5"
+        _main_mod.APP_VERSION = "2.2.6"
 except Exception:
     pass
 

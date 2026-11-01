@@ -63,6 +63,10 @@
                                 <i class="fa-solid fa-folder-plus"></i> Add Folder
                             </button>
 
+                            <button class="btn btn-secondary btn-sm" id="btn-toggle-all-jobs" title="Expand or Collapse All Jobs">
+                                <i class="fa-solid fa-arrows-up-down" id="toggle-all-jobs-icon"></i> <span id="toggle-all-jobs-text">Collapse All</span>
+                            </button>
+
                             <button class="btn btn-danger-outline btn-sm" id="btn-retry-errors">
                                 <i class="fa-solid fa-triangle-exclamation"></i> Retry Errors
                             </button>
@@ -79,28 +83,16 @@
                     <div class="queue-table-container" id="drop-zone">
                         <div class="drag-overlay" id="drag-overlay">
                             <i class="fa-solid fa-cloud-arrow-up drag-icon"></i>
-                            <p>Drop video files here to add to queue</p>
+                            <p>Drop folder or video files here to add as a Job</p>
                         </div>
                         <div class="empty-state" id="empty-state">
                             <i class="fa-solid fa-clapperboard empty-icon"></i>
-                            <h3>No videos in queue</h3>
-                            <p>Drag and drop files here, or use the "Add Files" buttons to start.</p>
+                            <h3>No jobs in queue</h3>
+                            <p>Drag and drop a folder or video files here, or use "+ Add Files" / "+ Add Folder". Each add creates a separate Job box with its episodes inside.</p>
                         </div>
-                        <table class="queue-table" id="queue-table" style="display: none;">
-                            <thead>
-                                <tr>
-                                    <th width="40px"><input type="checkbox" id="select-all-videos"></th>
-                                    <th>VIDEO NAME</th>
-                                    <th>SOURCE PATH</th>
-                                    <th width="150px">PROGRESS</th>
-                                    <th width="180px">STATUS</th>
-                                    <th width="50px"></th>
-                                </tr>
-                            </thead>
-                            <tbody id="queue-tbody">
-                                <!-- Dynamic rows will be inserted here -->
-                            </tbody>
-                        </table>
+                        <div class="queue-jobs-container" id="queue-jobs-container">
+                            <!-- Dynamic Job Boxes (Drop boxes) will be inserted here -->
+                        </div>
                     </div>
 
                     <!-- Queue Status Footer -->
@@ -110,6 +102,7 @@
                             <span class="badge badge-error" id="filter-error">ERROR: 0</span>
                             <span class="badge badge-success" id="filter-completed">COMPLETED: 0</span>
                             <span class="badge badge-warning" id="filter-total">TOTAL: 0</span>
+                            <span class="badge" id="filter-jobs" style="background: rgba(229, 169, 59, 0.15); color: #e5a93b; border: 1px solid rgba(229, 169, 59, 0.3);">JOBS: 0</span>
                         </div>
                     </div>
                 </section>
@@ -707,11 +700,11 @@
 
                 <!-- Processing Actions -->
                 <div class="action-buttons-group">
-                    <button class="btn btn-danger btn-lg btn-cancel" id="btn-cancel-processing" disabled>
-                        <i class="fa-solid fa-circle-stop"></i> CANCEL
-                    </button>
                     <button class="btn btn-gold btn-lg btn-process" id="btn-start-processing">
                         <i class="fa-solid fa-play"></i> START PROCESSING
+                    </button>
+                    <button class="btn btn-danger btn-lg btn-cancel" id="btn-cancel-processing" disabled>
+                        <i class="fa-solid fa-circle-stop"></i> CANCEL
                     </button>
                 </div>
             </div>

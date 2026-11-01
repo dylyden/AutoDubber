@@ -12,6 +12,11 @@ const dragOverlay = document.getElementById('drag-overlay');
 const emptyState = document.getElementById('empty-state');
 const queueTable = document.getElementById('queue-table');
 const queueTbody = document.getElementById('queue-tbody');
+const queueJobsContainer = document.getElementById('queue-jobs-container');
+const btnToggleAllJobs = document.getElementById('btn-toggle-all-jobs');
+const filterJobs = document.getElementById('filter-jobs');
+let collapsedJobs = new Set();
+let allJobsCollapsed = false;
 const selectAllCheckbox = document.getElementById('selectAllVideos');
 const logsConsole = document.getElementById('logs-console');
 
@@ -697,46 +702,155 @@ function setupEventListeners() {
             document.querySelectorAll('.video-checkbox').forEach(cb => {
                 cb.checked = checked;
             });
+            document.querySelectorAll('.job-select-all').forEach(cb => {
+                cb.checked = checked;
+            });
         });
     }
 
-    // Drag and drop event handlers
+    if (btnToggleAllJobs) {
+        btnToggleAllJobs.addEventListener('click', toggleAllJobs);
+    }
+
+    // Drag and drop event handlers with counter and window protection
+    let dragCounter = 0;
+
+    // Prevent default browser behavior on all drag events across the entire window
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+        window.addEventListener(eventName, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+        }, false);
+    });
+
     window.addEventListener('dragenter', (e) => {
-        e.preventDefault();
-        dragOverlay.classList.add('active');
+        dragCounter++;
+        if (dragOverlay) dragOverlay.classList.add('active');
     });
 
-    dragOverlay.addEventListener('dragover', (e) => {
-        e.preventDefault();
+    window.addEventListener('dragover', (e) => {
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+        if (dragOverlay && !dragOverlay.classList.contains('active')) {
+            dragOverlay.classList.add('active');
+        }
     });
 
-    dragOverlay.addEventListener('dragleave', (e) => {
-        e.preventDefault();
-        dragOverlay.classList.remove('active');
+    window.addEventListener('dragleave', (e) => {
+        dragCounter--;
+        if (dragCounter <= 0) {
+            dragCounter = 0;
+            if (dragOverlay) dragOverlay.classList.remove('active');
+        }
     });
 
-    dragOverlay.addEventListener('drop', async (e) => {
-        e.preventDefault();
-        dragOverlay.classList.remove('active');
+    window.addEventListener('drop', async (e) => {
+        dragCounter = 0;
+        if (dragOverlay) dragOverlay.classList.remove('active');
+        if (!e.dataTransfer) return;
 
-        // Since we are inside a browser environment, standard file drop only gives us files.
-        // We will send file names/sizes to the backend. For local server paths, native browsing is preferred.
-        // But we will handle basic drag and drop metadata to allow local mocking.
-        const files = Array.from(e.dataTransfer.files);
-        if (files.length > 0) {
-            addLog(`Dropped ${files.length} file(s). Uploading metadata to server...`, 'info');
+        const dataTransfer = e.dataTransfer;
+        let folderName = "";
+        const filesToUpload = [];
 
-            // Call API to add dropped files
-            const fileData = files.map(f => ({ name: f.name, size: f.size, path: f.path || "" }));
+        // Helper: recursively extract all video files from DirectoryEntry with batched readEntries support
+        async function readDirectory(dirEntry, pathPrefix = "") {
+            const dirReader = dirEntry.createReader();
+            const readBatch = () => new Promise((resolve) => {
+                dirReader.readEntries(resolve, () => resolve([]));
+            });
+
+            let entries;
+            do {
+                entries = await readBatch();
+                if (entries && entries.length > 0) {
+                    for (const entry of entries) {
+                        const currentRelPath = pathPrefix ? `${pathPrefix}/${entry.name}` : entry.name;
+                        if (entry.isFile) {
+                            if (entry.name.match(/\.(mp4|mkv|avi|mov|flv|ts|webm|3gp|wmv|m4v)$/i)) {
+                                const file = await new Promise(resFile => entry.file(resFile, () => resFile(null)));
+                                if (file) {
+                                    filesToUpload.push({
+                                        name: file.name,
+                                        size: file.size || 0,
+                                        path: file.path || "",
+                                        relative_path: currentRelPath
+                                    });
+                                }
+                            }
+                        } else if (entry.isDirectory) {
+                            await readDirectory(entry, currentRelPath);
+                        }
+                    }
+                }
+            } while (entries && entries.length > 0);
+        }
+
+        const items = dataTransfer.items;
+        if (items && items.length > 0) {
+            for (let i = 0; i < items.length; i++) {
+                const item = items[i];
+                if (item.webkitGetAsEntry) {
+                    const entry = item.webkitGetAsEntry();
+                    if (entry) {
+                        if (entry.isDirectory) {
+                            if (!folderName) folderName = entry.name;
+                            await readDirectory(entry, entry.name);
+                        } else if (entry.isFile) {
+                            if (entry.name.match(/\.(mp4|mkv|avi|mov|flv|ts|webm|3gp|wmv|m4v)$/i)) {
+                                const file = await new Promise(resFile => entry.file(resFile, () => resFile(null)));
+                                if (file) {
+                                    filesToUpload.push({
+                                        name: file.name,
+                                        size: file.size || 0,
+                                        path: file.path || "",
+                                        relative_path: file.name
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback to dataTransfer.files if webkitGetAsEntry didn't yield files
+        if (filesToUpload.length === 0 && dataTransfer.files && dataTransfer.files.length > 0) {
+            const rawFiles = Array.from(dataTransfer.files);
+            for (const file of rawFiles) {
+                if (file.name.match(/\.(mp4|mkv|avi|mov|flv|ts|webm|3gp|wmv|m4v)$/i)) {
+                    filesToUpload.push({
+                        name: file.name,
+                        size: file.size || 0,
+                        path: file.path || "",
+                        relative_path: file.webkitRelativePath || file.name
+                    });
+                }
+            }
+            if (!folderName && rawFiles[0]) {
+                if (rawFiles[0].webkitRelativePath) {
+                    folderName = rawFiles[0].webkitRelativePath.split('/')[0];
+                } else if (rawFiles[0].path) {
+                    const parts = rawFiles[0].path.replace(/\\/g, '/').split('/');
+                    if (parts.length > 1) {
+                        folderName = parts[parts.length - 2];
+                    }
+                }
+            }
+        }
+
+        if (filesToUpload.length > 0) {
+            const jobTitle = folderName || `Job (${filesToUpload.length} EPs)`;
+            addLog(`Processing dropped ${filesToUpload.length} file(s) under Job '${jobTitle}'...`, 'info');
             try {
                 const response = await fetch('/api/queue/add-dropped', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ files: fileData })
+                    body: JSON.stringify({ files: filesToUpload, job_name: jobTitle })
                 });
                 const data = await response.json();
                 videoQueue = data.queue;
                 refreshQueueUI();
+                addLog(`Job '${jobTitle}' added with ${filesToUpload.length} item(s).`, 'success');
             } catch (err) {
                 addLog(`Error adding dropped files: ${err.message}`, 'error');
             }
@@ -811,66 +925,348 @@ async function browseNative(type) {
     }
 }
 
-// Refresh Queue UI
+// Group queue items into discrete Job batches
+function getJobsFromQueue(queue) {
+    const jobsMap = new Map();
+    queue.forEach(item => {
+        const jId = item.job_id || 'default_job';
+        const jName = item.job_name || 'General Batch';
+        if (!jobsMap.has(jId)) {
+            jobsMap.set(jId, {
+                id: jId,
+                name: jName,
+                items: []
+            });
+        }
+        jobsMap.get(jId).items.push(item);
+    });
+    return Array.from(jobsMap.values());
+}
+
+// Toggle collapse/expand of a specific Job Dropdown Box
+function toggleJobCollapse(jobId) {
+    const body = document.getElementById(`job-body-${jobId}`);
+    const icon = document.getElementById(`job-chevron-${jobId}`);
+    if (!body) return;
+    const isNowCollapsed = !body.classList.contains('collapsed');
+    if (isNowCollapsed) {
+        body.classList.add('collapsed');
+        if (icon) icon.className = 'fa-solid fa-chevron-right';
+        collapsedJobs.add(jobId);
+    } else {
+        body.classList.remove('collapsed');
+        if (icon) icon.className = 'fa-solid fa-chevron-down';
+        collapsedJobs.delete(jobId);
+    }
+}
+
+// Toggle Expand / Collapse all jobs at once
+function toggleAllJobs() {
+    const jobs = getJobsFromQueue(videoQueue);
+    if (jobs.length === 0) return;
+    allJobsCollapsed = !allJobsCollapsed;
+    jobs.forEach(j => {
+        const body = document.getElementById(`job-body-${j.id}`);
+        const icon = document.getElementById(`job-chevron-${j.id}`);
+        if (allJobsCollapsed) {
+            if (body) body.classList.add('collapsed');
+            if (icon) icon.className = 'fa-solid fa-chevron-right';
+            collapsedJobs.add(j.id);
+        } else {
+            if (body) body.classList.remove('collapsed');
+            if (icon) icon.className = 'fa-solid fa-chevron-down';
+            collapsedJobs.delete(j.id);
+        }
+    });
+    const toggleBtnText = document.getElementById('toggle-all-jobs-text');
+    if (toggleBtnText) toggleBtnText.textContent = allJobsCollapsed ? 'Expand All' : 'Collapse All';
+}
+
+// Toggle select all checkboxes for a specific Job
+function toggleJobSelectAll(jobId, isChecked) {
+    document.querySelectorAll(`.video-checkbox[data-job-id="${jobId}"]`).forEach(cb => {
+        cb.checked = isChecked;
+    });
+}
+
+// Delete an entire Job box and all its episodes
+async function deleteJob(jobId) {
+    if (!confirm('Are you sure you want to delete this Job box and all its episodes?')) return;
+    try {
+        const response = await fetch(`/api/queue/job/${jobId}`, { method: 'DELETE' });
+        const data = await response.json();
+        videoQueue = data.queue;
+        collapsedJobs.delete(jobId);
+        refreshQueueUI();
+        addLog('Deleted Job and cleaned up associated files.', 'info');
+    } catch (e) {
+        addLog(`Failed to delete job: ${e.message}`, 'error');
+    }
+}
+
+// Retry all failed episodes within a specific Job
+async function retryJobErrors(jobId) {
+    try {
+        const response = await fetch(`/api/queue/job/retry/${jobId}`, { method: 'POST' });
+        const data = await response.json();
+        videoQueue = data.queue;
+        refreshQueueUI();
+        addLog('Retrying failed episodes for Job.', 'info');
+    } catch (e) {
+        addLog(`Failed to retry job errors: ${e.message}`, 'error');
+    }
+}
+
+// Rename a Job Box
+async function renameJob(jobId, currentName) {
+    const newName = prompt('Enter new Job Name:', currentName);
+    if (!newName || !newName.trim() || newName.trim() === currentName) return;
+    try {
+        const response = await fetch('/api/queue/job/rename', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ job_id: jobId, job_name: newName.trim() })
+        });
+        const data = await response.json();
+        videoQueue = data.queue;
+        refreshQueueUI();
+        addLog(`Renamed Job to '${newName.trim()}'.`, 'success');
+    } catch (e) {
+        addLog(`Failed to rename job: ${e.message}`, 'error');
+    }
+}
+
+// Refresh Queue UI (Renders Job Boxes with Dropdown Accordions)
+function getLanguageLabel(code) {
+    if (!code) return 'Khmer';
+    const select = document.getElementById('select-target-lang');
+    if (select) {
+        const opt = select.querySelector(`option[value="${code}"]`);
+        if (opt) {
+            const rawText = opt.textContent.replace(/[\uD83C-\uDBFF\uDC00-\uDFFF]+/g, '').trim();
+            const cleanName = rawText.split('(')[0].replace(/[-★🚀]/g, '').trim();
+            return cleanName || code;
+        }
+    }
+    const dict = {
+        'km-KH': 'Khmer',
+        'en-US': 'English (US)',
+        'en-GB': 'English (UK)',
+        'es-ES': 'Spanish',
+        'de-DE': 'German',
+        'fr-FR': 'French',
+        'nl-NL': 'Dutch',
+        'it-IT': 'Italian',
+        'pt-BR': 'Portuguese',
+        'th-TH': 'Thai',
+        'my-MM': 'Burmese',
+        'vi-VN': 'Vietnamese',
+        'id-ID': 'Indonesian',
+        'fil-PH': 'Filipino',
+        'ja-JP': 'Japanese',
+        'ko-KR': 'Korean',
+        'zh-CN': 'Chinese'
+    };
+    return dict[code] || code;
+}
+
 function refreshQueueUI() {
+    const jobsContainer = document.getElementById('queue-jobs-container');
+    if (!jobsContainer) return;
+
     if (videoQueue.length === 0) {
         emptyState.style.display = 'flex';
-        queueTable.style.display = 'none';
-    } else {
-        emptyState.style.display = 'none';
-        queueTable.style.display = 'table';
+        jobsContainer.innerHTML = '';
+        if (filterError) filterError.textContent = 'ERROR: 0';
+        if (filterCompleted) filterCompleted.textContent = 'COMPLETED: 0';
+        if (filterTotal) filterTotal.textContent = 'TOTAL: 0';
+        if (filterJobs) filterJobs.textContent = 'JOBS: 0';
+        return;
     }
 
-    queueTbody.innerHTML = '';
+    emptyState.style.display = 'none';
 
-    let errorCount = 0;
-    let completedCount = 0;
+    const jobs = getJobsFromQueue(videoQueue);
+    let globalErrorCount = 0;
+    let globalCompletedCount = 0;
 
-    videoQueue.forEach((video, index) => {
-        if (video.status === 'Error') errorCount++;
-        if (video.status === 'Completed') completedCount++;
+    jobsContainer.innerHTML = '';
 
-        const tr = document.createElement('tr');
-        if (video.status === 'Processing') tr.className = 'processing';
+    jobs.forEach((job, jIdx) => {
+        const total = job.items.length;
+        const completed = job.items.filter(i => i.status === 'Completed').length;
+        const errors = job.items.filter(i => i.status === 'Error').length;
+        const processing = job.items.filter(i => i.status === 'Processing' || (i.status && i.status.includes('...'))).length;
+        const cancelled = job.items.filter(i => i.status === 'Cancelled').length;
+        const jobConfig = (job.items[0] && job.items[0].config) ? job.items[0].config : {};
+        const targetLang = jobConfig.target_lang || 'km-KH';
+        const langLabel = getLanguageLabel(targetLang);
 
-        tr.innerHTML = `
-            <td><input type="checkbox" class="video-checkbox" data-id="${video.id}"></td>
-            <td class="video-name-cell" title="${video.name}">${index + 1}. 🎬 ${video.name}</td>
-            <td class="video-path-cell" title="${video.path}">${video.path || 'Local Upload'}</td>
-            <td>
-                <div class="progress-container">
-                    <div class="progress-bar-bg">
-                        <div class="progress-bar-fill" style="width: ${video.progress}%"></div>
+        globalCompletedCount += completed;
+        globalErrorCount += errors;
+
+        const totalProgress = job.items.reduce((acc, cur) => acc + (cur.progress || 0), 0);
+        const avgProgress = total > 0 ? Math.round(totalProgress / total) : 0;
+
+        const notStarted = job.items.filter(i => i.status === 'Not Started' || !i.config_locked).length;
+        let jobStatusText = 'In Queue';
+        let jobStatusIcon = 'fa-clock';
+        let jobStatusClass = 'status-queued';
+
+        if (processing > 0) {
+            jobStatusText = `Processing (${completed}/${total})`;
+            jobStatusIcon = 'fa-spinner fa-spin';
+            jobStatusClass = 'status-processing';
+        } else if (completed === total && total > 0) {
+            jobStatusText = 'Completed';
+            jobStatusIcon = 'fa-circle-check';
+            jobStatusClass = 'status-completed';
+        } else if (errors > 0) {
+            jobStatusText = `${errors} Failed`;
+            jobStatusIcon = 'fa-triangle-exclamation';
+            jobStatusClass = 'status-error';
+        } else if (cancelled > 0) {
+            jobStatusText = 'Cancelled';
+            jobStatusIcon = 'fa-ban';
+            jobStatusClass = 'status-cancelled';
+        } else if (notStarted === total || !job.items[0]?.config_locked) {
+            jobStatusText = 'Not Started';
+            jobStatusIcon = 'fa-pause';
+            jobStatusClass = 'status-not-started';
+        }
+
+        const isCollapsed = collapsedJobs.has(job.id);
+
+        const jobBox = document.createElement('div');
+        jobBox.className = `queue-job-box ${processing > 0 ? 'processing' : ''}`;
+        jobBox.id = `job-box-${job.id}`;
+
+        jobBox.innerHTML = `
+            <div class="job-header" onclick="toggleJobCollapse('${job.id}')">
+                <div class="job-header-left">
+                    <button type="button" class="job-toggle-btn" title="Toggle Episodes Dropdown">
+                        <i class="fa-solid ${isCollapsed ? 'fa-chevron-right' : 'fa-chevron-down'}" id="job-chevron-${job.id}"></i>
+                    </button>
+                    <div class="job-icon-badge">
+                        <i class="fa-solid fa-folder-closed"></i>
                     </div>
-                    <div class="progress-text">${video.progress}%</div>
+                    <div class="job-info">
+                        <div class="job-title-row">
+                            <span class="job-title" title="${job.name}">${job.name}</span>
+                            <button type="button" class="btn-job-rename" title="Rename Job" onclick="event.stopPropagation(); renameJob('${job.id}', '${job.name.replace(/'/g, "\\'")}')">
+                                <i class="fa-solid fa-pen"></i>
+                            </button>
+                        </div>
+                        <div class="job-meta">
+                            <span class="job-meta-item"><i class="fa-solid fa-film"></i> ${total} EP${total > 1 ? 's' : ''}</span>
+                            <span class="job-meta-sep">•</span>
+                            <span class="job-meta-item job-meta-done">${completed}/${total} Done</span>
+                            ${errors > 0 ? `<span class="job-meta-sep">•</span><span class="job-meta-item job-meta-error"><i class="fa-solid fa-triangle-exclamation"></i> ${errors} Error${errors > 1 ? 's' : ''}</span>` : ''}
+                            <span class="job-meta-sep">•</span>
+                            <span class="job-meta-item" style="color: var(--accent-gold); font-weight: 600;" title="Configured Target Language: ${targetLang}"><i class="fa-solid fa-language"></i> ${langLabel}</span>
+                        </div>
+                    </div>
                 </div>
-            </td>
-            <td>
-                <span class="status-badge status-${video.status.toLowerCase().replace('..', '').trim()}" style="display: inline-flex; align-items: center; gap: 4px;">
-                    <i class="fa-solid ${getStatusIcon(video.status)}"></i>
-                    ${video.status}
-                </span>
-                ${video.status === 'Completed' ? `
-                <button class="btn-edit-row" onclick="openSubtitleEditor('${video.id}', '${video.name.replace(/'/g, "\\'")}', '${video.path.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}')" style="margin-left: 6px;">
-                    <i class="fa-solid fa-pen-to-square"></i> Edit
-                </button>` : ''}
-            </td>
-            <td>
-                <button class="btn-delete-row" onclick="deleteVideo('${video.id}')">
-                    <i class="fa-solid fa-trash"></i>
-                </button>
-            </td>
+
+                <div class="job-header-center">
+                    <div class="job-progress-wrapper" title="Job Overall Progress: ${avgProgress}%">
+                        <div class="job-progress-bar-bg">
+                            <div class="job-progress-bar-fill" id="job-bar-${job.id}" style="width: ${avgProgress}%"></div>
+                        </div>
+                        <div class="job-progress-text" id="job-progress-${job.id}">${avgProgress}%</div>
+                    </div>
+                </div>
+
+                <div class="job-header-right" onclick="event.stopPropagation()">
+                    <span class="status-badge ${jobStatusClass}" id="job-badge-${job.id}">
+                        <i class="fa-solid ${jobStatusIcon}"></i>
+                        <span>${jobStatusText}</span>
+                    </span>
+                    <div class="job-quick-actions">
+                        ${errors > 0 ? `
+                        <button type="button" class="btn btn-sm btn-danger-outline" title="Retry Failed in Job" onclick="retryJobErrors('${job.id}')">
+                            <i class="fa-solid fa-rotate-right"></i>
+                        </button>` : ''}
+                        <button type="button" class="btn btn-sm btn-danger-outline" title="Delete Job" onclick="deleteJob('${job.id}')">
+                            <i class="fa-solid fa-trash-can"></i>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="job-episodes-dropdown ${isCollapsed ? 'collapsed' : ''}" id="job-body-${job.id}">
+                <table class="queue-table job-episodes-table">
+                    <thead>
+                        <tr>
+                            <th width="35px"><input type="checkbox" class="job-select-all" data-job-id="${job.id}" onchange="toggleJobSelectAll('${job.id}', this.checked)"></th>
+                            <th>EPISODE / FILE</th>
+                            <th>SOURCE PATH</th>
+                            <th width="150px">PROGRESS</th>
+                            <th width="180px">STATUS</th>
+                            <th width="45px"></th>
+                        </tr>
+                    </thead>
+                    <tbody id="job-tbody-${job.id}">
+                    </tbody>
+                </table>
+            </div>
         `;
-        queueTbody.appendChild(tr);
+
+        const tbody = jobBox.querySelector(`#job-tbody-${job.id}`);
+        job.items.forEach((video, epIdx) => {
+            const tr = document.createElement('tr');
+            tr.id = `video-row-${video.id}`;
+            if (video.status === 'Processing') tr.className = 'processing';
+
+            tr.innerHTML = `
+                <td><input type="checkbox" class="video-checkbox" data-id="${video.id}" data-job-id="${job.id}"></td>
+                <td class="video-name-cell" title="${video.name}">${epIdx + 1}. 🎬 ${video.name}</td>
+                <td class="video-path-cell" title="${video.path}">${video.path || 'Local Upload'}</td>
+                <td>
+                    <div class="progress-container">
+                        <div class="progress-bar-bg">
+                            <div class="progress-bar-fill" id="progress-bar-${video.id}" style="width: ${video.progress}%"></div>
+                        </div>
+                        <div class="progress-text" id="progress-text-${video.id}">${video.progress}%</div>
+                    </div>
+                </td>
+                <td>
+                    ${(() => {
+                        const isEpNotStarted = video.status === 'Not Started' || (!video.config_locked && video.status === 'Queued');
+                        const epStatusClass = isEpNotStarted ? 'status-not-started' : `status-${video.status.toLowerCase().replace('..', '').replace(' ', '-').trim()}`;
+                        const epStatusText = isEpNotStarted ? 'Not Started' : (video.status === 'Queued' ? 'In Queue' : video.status);
+                        const epStatusIcon = isEpNotStarted ? 'fa-pause' : getStatusIcon(video.status);
+                        return `<span class="status-badge ${epStatusClass}" id="status-badge-${video.id}" style="display: inline-flex; align-items: center; gap: 4px;">
+                            <i class="fa-solid ${epStatusIcon}"></i>
+                            <span>${epStatusText}</span>
+                        </span>`;
+                    })()}
+                    ${video.status === 'Completed' ? `
+                    <button class="btn-edit-row" onclick="openSubtitleEditor('${video.id}', '${video.name.replace(/'/g, "\\'")}', '${video.path.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}')" style="margin-left: 6px;">
+                        <i class="fa-solid fa-pen-to-square"></i> Edit
+                    </button>` : ''}
+                </td>
+                <td>
+                    <button class="btn-delete-row" title="Delete Episode" onclick="deleteVideo('${video.id}')">
+                        <i class="fa-solid fa-trash"></i>
+                    </button>
+                </td>
+            `;
+            tbody.appendChild(tr);
+        });
+
+        jobsContainer.appendChild(jobBox);
     });
 
-    filterError.textContent = `ERROR: ${errorCount}`;
-    filterCompleted.textContent = `COMPLETED: ${completedCount}`;
-    filterTotal.textContent = `TOTAL: ${videoQueue.length}`;
+    if (filterError) filterError.textContent = `ERROR: ${globalErrorCount}`;
+    if (filterCompleted) filterCompleted.textContent = `COMPLETED: ${globalCompletedCount}`;
+    if (filterTotal) filterTotal.textContent = `TOTAL: ${videoQueue.length}`;
+    if (filterJobs) filterJobs.textContent = `JOBS: ${jobs.length}`;
 }
 
 function getStatusIcon(status) {
-    status = status.toLowerCase();
+    status = (status || '').toLowerCase();
+    if (status.includes('not started') || status.includes('pending')) return 'fa-pause';
     if (status.includes('queued')) return 'fa-clock';
     if (status.includes('completed')) return 'fa-circle-check';
     if (status.includes('error')) return 'fa-triangle-exclamation';
@@ -878,12 +1274,89 @@ function getStatusIcon(status) {
     return 'fa-spinner fa-spin'; // Processing / Isolating / Dubbing
 }
 
-// Update specific video progress in UI directly for smoothness
+// In-place smooth DOM update for progress without jittering UI
 function updateVideoProgress(id, progress, status) {
     const video = videoQueue.find(v => v.id === id);
-    if (video) {
-        video.progress = progress;
-        video.status = status;
+    if (!video) return;
+
+    video.progress = progress;
+    video.status = status;
+
+    const bar = document.getElementById(`progress-bar-${id}`);
+    const text = document.getElementById(`progress-text-${id}`);
+    const badge = document.getElementById(`status-badge-${id}`);
+    const row = document.getElementById(`video-row-${id}`);
+
+    if (bar && text && badge && row) {
+        bar.style.width = `${progress}%`;
+        text.textContent = `${progress}%`;
+        badge.className = `status-badge status-${status.toLowerCase().replace('..', '').trim()}`;
+        badge.innerHTML = `<i class="fa-solid ${getStatusIcon(status)}"></i> <span>${status}</span>`;
+        if (status === 'Processing') row.classList.add('processing');
+        else row.classList.remove('processing');
+
+        if (status === 'Completed' && !badge.parentNode.querySelector('.btn-edit-row')) {
+            const editBtn = document.createElement('button');
+            editBtn.className = 'btn-edit-row';
+            editBtn.style.marginLeft = '6px';
+            editBtn.innerHTML = '<i class="fa-solid fa-pen-to-square"></i> Edit';
+            editBtn.onclick = () => openSubtitleEditor(video.id, video.name, video.path);
+            badge.parentNode.appendChild(editBtn);
+        }
+
+        const jId = video.job_id || 'default_job';
+        const jobItems = videoQueue.filter(v => (v.job_id || 'default_job') === jId);
+        const total = jobItems.length;
+        const completed = jobItems.filter(i => i.status === 'Completed').length;
+        const errors = jobItems.filter(i => i.status === 'Error').length;
+        const processing = jobItems.filter(i => i.status === 'Processing' || (i.status && i.status.includes('...'))).length;
+        const totalProgress = jobItems.reduce((acc, cur) => acc + (cur.progress || 0), 0);
+        const avgProgress = total > 0 ? Math.round(totalProgress / total) : 0;
+
+        const jobBar = document.getElementById(`job-bar-${jId}`);
+        const jobText = document.getElementById(`job-progress-${jId}`);
+        const jobBadge = document.getElementById(`job-badge-${jId}`);
+        const jobBox = document.getElementById(`job-box-${jId}`);
+
+        if (jobBar) jobBar.style.width = `${avgProgress}%`;
+        if (jobText) jobText.textContent = `${avgProgress}%`;
+        if (jobBox) {
+            if (processing > 0) jobBox.classList.add('processing');
+            else jobBox.classList.remove('processing');
+        }
+
+        if (jobBadge) {
+            const notStarted = jobItems.filter(i => i.status === 'Not Started' || !i.config_locked).length;
+            let jStatText = 'In Queue';
+            let jStatIcon = 'fa-clock';
+            let jStatClass = 'status-queued';
+
+            if (processing > 0) {
+                jStatText = `Processing (${completed}/${total})`;
+                jStatIcon = 'fa-spinner fa-spin';
+                jStatClass = 'status-processing';
+            } else if (completed === total && total > 0) {
+                jStatText = 'Completed';
+                jStatIcon = 'fa-circle-check';
+                jStatClass = 'status-completed';
+            } else if (errors > 0) {
+                jStatText = `${errors} Failed`;
+                jStatIcon = 'fa-triangle-exclamation';
+                jStatClass = 'status-error';
+            } else if (notStarted === total || !jobItems[0]?.config_locked) {
+                jStatText = 'Not Started';
+                jStatIcon = 'fa-pause';
+                jStatClass = 'status-not-started';
+            }
+
+            jobBadge.className = `status-badge ${jStatClass}`;
+            jobBadge.innerHTML = `<i class="fa-solid ${jStatIcon}"></i> <span>${jStatText}</span>`;
+        }
+
+        if (filterError) filterError.textContent = `ERROR: ${videoQueue.filter(i => i.status === 'Error').length}`;
+        if (filterCompleted) filterCompleted.textContent = `COMPLETED: ${videoQueue.filter(i => i.status === 'Completed').length}`;
+        if (filterTotal) filterTotal.textContent = `TOTAL: ${videoQueue.length}`;
+    } else {
         refreshQueueUI();
     }
 }
@@ -1365,12 +1838,20 @@ function updateYtDropdownSummary() {
 function toggleProcessingUI(processing) {
     isProcessing = processing;
 
+    const actionGroup = document.querySelector('.action-buttons-group');
     if (processing) {
-        btnStartProcessing.style.display = 'none';
-        btnCancelProcessing.style.display = 'block';
+        if (actionGroup) actionGroup.classList.add('is-processing');
+        btnCancelProcessing.style.display = 'flex';
         btnCancelProcessing.disabled = false;
+        btnCancelProcessing.innerHTML = `<i class="fa-solid fa-circle-stop"></i> CANCEL`;
+
+        btnStartProcessing.style.display = 'flex';
+        btnStartProcessing.innerHTML = `<i class="fa-solid fa-play"></i> START PROCESSING`;
+        btnStartProcessing.className = 'btn btn-gold btn-lg btn-process';
+        btnStartProcessing.disabled = false;
     } else {
-        btnStartProcessing.style.display = 'block';
+        if (actionGroup) actionGroup.classList.remove('is-processing');
+        btnStartProcessing.style.display = 'flex';
         btnStartProcessing.innerHTML = `<i class="fa-solid fa-play"></i> START PROCESSING`;
         btnStartProcessing.className = 'btn btn-gold btn-lg btn-process';
         btnStartProcessing.disabled = false;
