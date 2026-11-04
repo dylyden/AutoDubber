@@ -369,7 +369,81 @@ def extract_json_payload(text: str) -> str:
 
 import hashlib
 import time
+import urllib.request
+import urllib.error
 from dataclasses import dataclass, field
+
+def parse_rate_limit_backoff(error_str, default_s: float = 60.0, min_s: float = 2.0, max_s: float = 60.0) -> float:
+    """
+    Parses Google API 429 response error strings to extract precise Retry-After or quota reset delays.
+    Prevents thread starvation caused by hardcoded 60s sleep during transient 2-5s burst limits.
+    """
+    text = str(error_str)
+    # Check for Retry-After header format (e.g., 'Retry-After: 4')
+    m = re.search(r'retry[-_]after[:=]\s*([0-9.]+)', text, re.IGNORECASE)
+    if m:
+        try:
+            return max(min_s, min(float(m.group(1)), max_s))
+        except Exception:
+            pass
+    # Check for text patterns: 'retry after 4.5s', 'retry in 6 seconds'
+    m2 = re.search(r'retry\s+(?:after|in)\s+([0-9.]+)\s*(?:s|sec|seconds?)', text, re.IGNORECASE)
+    if m2:
+        try:
+            return max(min_s, min(float(m2.group(1)), max_s))
+        except Exception:
+            pass
+    # Standard resource exhausted rate limit burst typically requires 8-12 seconds
+    if 'resourceexhausted' in text.lower() or '429' in text:
+        return 12.0
+    return default_s
+
+def probe_gemini_key_health(clean_key: str, key_type: str = "gemini", timeout: float = 3.5) -> dict:
+    """
+    Pre-flight probe to check key validity without burning generation tokens.
+    Handles Gemini API endpoints as well as Groq cloud endpoints.
+    """
+    if not clean_key:
+        return {"valid": False, "status": 400, "reason": "Empty Key"}
+    
+    # Handle Groq Cloud LPU keys separately
+    if clean_key.startswith("gsk_") or key_type == "groq":
+        url = "https://api.groq.com/openai/v1/models"
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"Bearer {clean_key}",
+            "User-Agent": "AutoDubber-HealthCheck/2.2.6"
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status == 200:
+                    return {"valid": True, "status": 200, "reason": "Active (Groq)"}
+                return {"valid": False, "status": resp.status, "reason": f"HTTP {resp.status}"}
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                return {"valid": False, "status": e.code, "reason": "Invalid or Expired Groq Key"}
+            if e.code == 429:
+                return {"valid": True, "status": 429, "reason": "Rate Limited (Active Groq)"}
+            return {"valid": False, "status": e.code, "reason": f"HTTP {e.code}"}
+        except Exception as e:
+            return {"valid": True, "status": 0, "reason": f"Groq probe skipped: {e}"}
+
+    # Standard Google Gemini API endpoint
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={clean_key}"
+    req = urllib.request.Request(url, headers={"User-Agent": "AutoDubber-HealthCheck/2.2.6"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status == 200:
+                return {"valid": True, "status": 200, "reason": "Active (Gemini)"}
+            return {"valid": False, "status": resp.status, "reason": f"HTTP {resp.status}"}
+    except urllib.error.HTTPError as e:
+        if e.code == 400:
+            return {"valid": False, "status": 400, "reason": "Invalid or Revoked Key"}
+        if e.code == 429:
+            return {"valid": True, "status": 429, "reason": "Rate Limited (Active Gemini)"}
+        return {"valid": False, "status": e.code, "reason": f"HTTP {e.code}"}
+    except Exception as e:
+        # Transient network issues should not permanently discard the key
+        return {"valid": True, "status": 0, "reason": f"Network probe skipped: {e}"}
 
 @dataclass
 class KeyHealth:
@@ -379,10 +453,12 @@ class KeyHealth:
     key_type: str
     cooldown_until: float = 0.0
     in_use: int = 0
+    is_valid: bool = True
+    probe_status: str = "Unchecked"
     uploaded_files: dict = field(default_factory=dict)  # file_hash -> uploaded_file_obj
 
     def is_available(self) -> bool:
-        return time.monotonic() >= self.cooldown_until
+        return self.is_valid and time.monotonic() >= self.cooldown_until
 
 
 class ApiKeyPool:
@@ -417,6 +493,31 @@ class ApiKeyPool:
             if clean_k not in active_clean:
                 del self.health_map[clean_k]
 
+    async def validate_pool_health(self) -> dict:
+        """
+        Asynchronously validates all keys in the pool in parallel.
+        Disables dead/revoked keys so active translation runs never stall leasing broken keys.
+        """
+        async with self.lock:
+            candidates = list(self.health_map.values())
+        if not candidates:
+            return {"total": 0, "active": 0, "invalid": 0}
+
+        loop = asyncio.get_event_loop()
+        def _check(kh: KeyHealth):
+            res = probe_gemini_key_health(kh.clean_key, key_type=kh.key_type)
+            kh.is_valid = res["valid"]
+            kh.probe_status = res["reason"]
+            if res.get("status") == 429:
+                kh.cooldown_until = time.monotonic() + 15.0
+            return kh.masked_key, kh.is_valid, kh.probe_status
+
+        tasks = [loop.run_in_executor(None, _check, kh) for kh in candidates]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        active_count = sum(1 for r in results if isinstance(r, tuple) and r[1])
+        invalid_count = len(candidates) - active_count
+        return {"total": len(candidates), "active": active_count, "invalid": invalid_count}
+
     @staticmethod
     def compute_file_hash(path: str) -> str:
         if not path or not os.path.exists(path):
@@ -432,12 +533,16 @@ class ApiKeyPool:
             if not self.health_map:
                 self.set_keys(self.keys)
 
+            # Prioritize valid keys; if all are marked invalid (e.g. offline), fall back to all candidates
+            valid_keys = [kh for kh in self.health_map.values() if kh.is_valid]
+            pool_candidates = valid_keys if valid_keys else list(self.health_map.values())
+
             gemini_candidates = [
-                kh for kh in self.health_map.values()
+                kh for kh in pool_candidates
                 if kh.key_type in ("gemini_new_aq", "gemini_legacy_aiza", "unknown")
             ]
             if not gemini_candidates:
-                gemini_candidates = list(self.health_map.values())
+                gemini_candidates = pool_candidates
 
             now = time.monotonic()
             available = [kh for kh in gemini_candidates if kh.cooldown_until <= now]
@@ -470,7 +575,7 @@ class ApiKeyPool:
         kh = await self.acquire_router_key(failed_keys=failed_keys)
         return kh.raw_key
 
-    async def release_key(self, key, rate_limited: bool = False):
+    async def release_key(self, key, rate_limited: bool = False, cooldown_seconds: float = 60.0):
         async with self.lock:
             info = identify_key_format(key)
             clean = info["key"] if info["key"] else str(key).strip()
@@ -478,7 +583,7 @@ class ApiKeyPool:
                 kh = self.health_map[clean]
                 kh.in_use = max(0, kh.in_use - 1)
                 if rate_limited:
-                    kh.cooldown_until = time.monotonic() + 60.0
+                    kh.cooldown_until = time.monotonic() + cooldown_seconds
             if key in self.leased_keys:
                 self.leased_keys[key] = max(0, self.leased_keys[key] - 1)
 
@@ -1666,20 +1771,22 @@ class Dubber:
 
             except Exception as e:
                 err_str = str(e)
+                backoff_s = 60.0
                 if "429" in err_str or "quota" in err_str.lower() or "resourceexhausted" in err_str.lower():
                     rate_limited = True
+                    backoff_s = parse_rate_limit_backoff(err_str, default_s=12.0)
                 if kh is not None:
                     failed_keys.add(kh.raw_key)
-                    await api_key_pool.release_router_key(kh, rate_limited=rate_limited, cooldown_seconds=60.0)
+                    await api_key_pool.release_router_key(kh, rate_limited=rate_limited, cooldown_seconds=backoff_s)
                     kh = None
 
                 masked = identify_key_format(list(failed_keys)[-1])["masked"] if failed_keys else "Unknown"
-                status_tag = "429 Rate-Limited (60s cooldown)" if rate_limited else "Error"
+                status_tag = f"429 Rate-Limited ({backoff_s:.1f}s backoff)" if rate_limited else "Error"
                 self.log(f"Router failover on Key {masked} [{status_tag}]: {err_str}", "warning")
 
                 if attempt < max_attempts - 1:
-                    wait_time = 6 if len(api_key_pool.keys) <= 1 else 1.5
-                    self.log(f"Router switching key/tier (attempt {attempt + 2}/{max_attempts}) in {wait_time}s...", "warning")
+                    wait_time = min(backoff_s, 4.0) if len(api_key_pool.keys) <= 1 else 1.0
+                    self.log(f"Router switching key/tier (attempt {attempt + 2}/{max_attempts}) in {wait_time:.1f}s...", "warning")
                     await asyncio.sleep(wait_time)
 
         raise RuntimeError("Failed to translate: All Gemini API keys and router tiers exhausted.")
@@ -3763,32 +3870,41 @@ class Dubber:
                 self.log(f"[YouTube Track {lang_idx}/{total_extra}] Translating dialogue to {lang_label} ({lang_code}) in {len(item_batches)} batch(es)...", "info")
 
                 async def _translate_yt_batch(b_items):
-                    trans_prompt = f"""
-                    You are an expert film and television dubbing dialogue director and translator.
-                    Translate the dialogue for each segment into target language: '{lang_label}'.
-                    
-                    CRITICAL CONSTRAINTS:
-                    1. Maintain the exact same segment structure and IDs ({len(b_items)} items).
-                    2. The spoken length of your translation MUST fit comfortably within the segment duration ('end' - 'start').
-                    3. Keep translated dialogue natural, expressive, and concise so actors can finish speaking naturally.
-                    4. Return ONLY a valid JSON array of objects with "id" and "translation". Do not include markdown code block syntax.
-                    
-                    Input Segments:
-                    {json.dumps(b_items, ensure_ascii=False)}
-                    
-                    JSON structure:
-                    [
-                      {{
-                        "id": {b_items[0]["id"]},
-                        "translation": "translated text in {lang_label}"
-                      }}
-                    ]
-                    """
+                    # Wire-compressed format: 30% fewer tokens, preserves exact line ID alignment
+                    wire_lines = [f"{item['id']}|{(item.get('text') or '').replace(chr(10), ' ').replace(chr(13), ' ').strip()}" for item in b_items]
+                    wire_payload = "\n".join(wire_lines)
+                    trans_prompt = f"""You are an expert film dubbing director and translator.
+Translate each dialogue line into target language: '{lang_label}'.
+
+CONSTRAINTS:
+1. Output format: ID|translated_text (one line per segment).
+2. Exactly {len(b_items)} output lines matching input IDs in exact order.
+3. Natural, cinematic dialogue fitting speech duration. Do not merge or omit lines.
+4. Output raw text ONLY. No markdown, no explanations, no brackets.
+
+INPUT:
+{wire_payload}
+"""
                     raw_resp = await self.call_gemini_with_retry(
                         None,
                         trans_prompt,
                         expected_segments=len(b_items)
                     )
+                    # Parse pipe-delimited compact wire response
+                    wire_map = {}
+                    for raw_line in raw_resp.strip().splitlines():
+                        m = re.match(r'^(\d+)\s*\|\s*(.*)$', raw_line.strip())
+                        if m:
+                            try:
+                                wire_map[int(m.group(1))] = m.group(2).strip()
+                            except Exception:
+                                pass
+
+                    if len(wire_map) >= max(1, int(len(b_items) * 0.70)):
+                        parsed = [{"id": item["id"], "translation": wire_map.get(item["id"], item.get("text", ""))} for item in b_items]
+                        return parsed
+
+                    # Fallback to JSON extractor if model returned JSON instead of wire format
                     clean_json_str = extract_json_payload(raw_resp)
                     clean_json_str = re.sub(r',\s*([\]}])', r'\1', clean_json_str)
                     try:
